@@ -269,9 +269,8 @@ ON CONFLICT (id) DO NOTHING;
 -- 3. Seed IoT Sensor Nodes
 -- Three sample field nodes, named and placed by zone only. They have no readings: those come from
 -- an edge device through edge-com (016_1 to 025), which also sets status and last_heartbeat from
--- them. An admin links each node to its edge device on the Devices page. Only columns that are
--- there before and after 016_2 are written, so this file still runs after every other file, and it
--- leaves nodes that are already there as they are.
+-- them. An admin links each node to its edge device on the Devices page. Running this again leaves
+-- nodes that are already there as they are.
 -- ------------------------------------------------------------------------------
 INSERT INTO public.iot_nodes (node_id, name, zone, status, last_heartbeat) VALUES
 ('NNP-IOT-01', 'Boardwalk West Sensor Node', 'Pangkalan Lubang Boardwalk', 'online', NULL),
