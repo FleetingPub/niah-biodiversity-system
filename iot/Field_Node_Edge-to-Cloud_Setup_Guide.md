@@ -1,6 +1,6 @@
 # Field Node Edge-to-Cloud Setup Guide
 
-Nov 5, 2026 · @aL
+Nov 5, 2026
 
 Each ESP32 sensor node sends a 21-byte binary frame over the region's Wi-Fi to Mosquitto on the edge (the Ubuntu VM): a routine reading every 60 s, and one at once when something starts (movement, a moved or blocked node, saturated soil, heavy rain). thing-com.py stores each reading's raw values in SQLite. cloud-com.py uploads them to Supabase every 60 s as one gzip-compressed batch through the edge-com function; readings that look like an alert go up at once (quick alert). In Supabase the readings land in the IoT tables of the Niah National Park project (`iot_readings` and the others), where edge-com decides the alerts with each node's own settings. Beep and baseline commands travel back down the same path. The dashboard that shows all this to officers is on hold; this guide covers everything up to the cloud database.
 
@@ -125,7 +125,7 @@ The IoT tables live in the same Supabase project as the rest of the Niah Nationa
 | File | Table | What it holds | Who can read / change it through the API |
 | --- | --- | --- | --- |
 | `016_1_iot_devices.sql` | `iot_devices` | One row per edge device (one per forest region): name, zone, on/off, when its token was made, when it was last heard from, its position | Officers and admins read (for the Sensors map), admins change |
-| `016_2_iot_nodes.sql` | `iot_nodes` (from 001) | Drops 001's sample telemetry columns, links each node to its edge device (`edge_device_id`), and adds its last reported state and its calibration and alert settings | Officers and admins read, admins change (the policies from 006) |
+| `016_2_iot_nodes.sql` | `iot_nodes` (from 001) | Links each node to its edge device (`edge_device_id`), and adds its last reported state and its calibration and alert settings | Officers and admins read, admins change (the policies from 006) |
 | `016_3_iot_device_tokens.sql` | `iot_device_tokens` | The SHA-256 hash of each device's token, and `iot_make_device_token()` that makes one | Nobody; only the function and edge-com use it |
 | `016_4_iot_readings.sql` | `iot_readings` | Every reading's raw values, plus `iot_raw_pct()` that turns raw ADC values into % | Officers and admins read; only edge-com adds |
 | `017_iot_alerts.sql` | `iot_alerts` | Every alert, with its start, end, severity and who acknowledged or resolved it; the quiet check, the node status update, acknowledge and resolve, and the `iot_node_status` view | Officers and admins read; acknowledge and resolve through the functions |
@@ -138,7 +138,7 @@ Each file checks that the one before it ran, is safe to run again, and runs as o
 
 **iot\_readings.** One row per reading, unique on (`node_id`, `boot_id`, `seq`). `recorded_at` is the measurement time, `ts_source` says which clock it came from, `received_at` when the edge got it and `inserted_at` when Supabase stored it. The values are raw: `temp_c`, `hum_pct`, `soil_raw`, `rain_raw`, `dist_cm`, `baseline_cm`, `beep_on`, `rssi`, `motion`. Each has a named check for what the part can really measure (temperature 0–50 °C, ADC 0–4095, distance 0–1000 cm …), so an error says which value it was. A device can't be deleted while it has readings, and neither can a node, so the history stays whole; turn a device off instead.
 
-**iot\_nodes.** Besides 001's `node_id`, `name`, `zone`, `status` and `last_heartbeat` (now the time of its newest reading), each node has:
+**iot\_nodes.** Besides 001's `node_id`, `name`, `zone`, `status` and `last_heartbeat` (the time of its newest reading), each node has:
 
 | Columns | Meaning (defaults) |
 | --- | --- |
