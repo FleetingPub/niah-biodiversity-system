@@ -1,6 +1,6 @@
 -- Sensor nodes (items 28 and 29): the iot_nodes table from 001 made ready for the field nodes.
--- Its sample telemetry columns go, each node is linked to the edge device it sends through, and it
--- gets its own calibration and alert settings. The policies from 006 stay: officers and admins
+-- Each node is linked to the edge device it sends through, and gets its own calibration and alert
+-- settings. The policies from 006 stay: officers and admins
 -- read, admins add, change and remove a node.
 -- Run it after 016_1.
 -- The SQL editor runs a whole file as one transaction, so if anything in here fails, nothing from
@@ -14,19 +14,9 @@ BEGIN
 END
 $$;
 
--- 1. 001's telemetry columns only ever held made-up numbers; readings are in iot_readings now.
--- status and last_heartbeat stay, and edge-com keeps them up to date from the readings.
-ALTER TABLE public.iot_nodes
-  DROP COLUMN IF EXISTS battery_percent,
-  DROP COLUMN IF EXISTS temperature_c,
-  DROP COLUMN IF EXISTS humidity_percent,
-  DROP COLUMN IF EXISTS soil_moisture_percent,
-  DROP COLUMN IF EXISTS pir_movement_detected,
-  DROP COLUMN IF EXISTS tilt_alert,
-  DROP COLUMN IF EXISTS threat_details;
-
--- 2. The edge device a node sends through (a node with no device can't get readings from anyone),
--- and what it last reported about itself.
+-- 1. The edge device a node sends through (a node with no device can't get readings from anyone),
+-- and what it last reported about itself. status and last_heartbeat are 001's, and edge-com keeps
+-- them up to date from the readings.
 ALTER TABLE public.iot_nodes
   ADD COLUMN IF NOT EXISTS edge_device_id text REFERENCES public.iot_devices (device_id) ON DELETE SET NULL,
   ADD COLUMN IF NOT EXISTS last_rssi smallint,
@@ -35,13 +25,12 @@ ALTER TABLE public.iot_nodes
 
 CREATE INDEX IF NOT EXISTS iot_nodes_edge_device_id ON public.iot_nodes (edge_device_id);
 
--- The IDs the sketch and the edge accept. NOT VALID: only rows added or changed from now on are
--- checked, so an existing sample node with another kind of ID doesn't stop this.
+-- The IDs the sketch and the edge accept
 ALTER TABLE public.iot_nodes DROP CONSTRAINT IF EXISTS iot_nodes_node_id_format;
 ALTER TABLE public.iot_nodes
-  ADD CONSTRAINT iot_nodes_node_id_format CHECK (node_id ~ '^[A-Za-z0-9_-]{1,32}$') NOT VALID;
+  ADD CONSTRAINT iot_nodes_node_id_format CHECK (node_id ~ '^[A-Za-z0-9_-]{1,32}$');
 
--- 3. Calibration and alert settings, per node. Change a value (Table Editor -> iot_nodes) and
+-- 2. Calibration and alert settings, per node. Change a value (Table Editor -> iot_nodes) and
 -- the Sensors page uses it straight away for all readings, old and new; the edge gets it with its
 -- next upload (cal_version goes up) and spots quick alerts with it.
 CREATE SEQUENCE IF NOT EXISTS public.iot_calibration_version_seq;
@@ -123,7 +112,7 @@ CREATE TRIGGER iot_nodes_cal_version
   BEFORE UPDATE ON public.iot_nodes
   FOR EACH ROW EXECUTE FUNCTION public.iot_nodes_bump_cal_version();
 
--- 4. What the website may read and change. 006 decides which rows, with its policies: officers and
+-- 3. What the website may read and change. 006 decides which rows, with its policies: officers and
 -- admins read, admins change. These grants only add the new columns, in case 006 granted iot_nodes
 -- by column. cal_version isn't in the UPDATE list: the trigger above sets it.
 GRANT SELECT (
