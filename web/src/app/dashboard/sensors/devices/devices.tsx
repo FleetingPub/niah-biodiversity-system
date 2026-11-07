@@ -95,7 +95,8 @@ function TokenPanel({
         The token for {deviceId}. Copy it now, because it isn’t shown again.
       </label>
       <p className="mt-1 text-sm text-moss">
-        It goes in this device’s secrets.h and nowhere else. Not in a chat, a commit or a screenshot.
+        It goes in this edge device’s secrets.toml, as edge_key (run iot-edge secrets on the edge), and
+        nowhere else. Not in a chat, a commit or a screenshot.
       </p>
       <input
         id={inputId}

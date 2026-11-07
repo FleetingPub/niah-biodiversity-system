@@ -8,7 +8,7 @@
 -- it is kept. It's safe to run again.
 -- supabase/tests/public-details.test.js checks it.
 
--- 017 has to be there first, and 001 to 016 before that.
+-- 017 has to be there first, and 001 to 016_4 before that.
 DO $$
 BEGIN
   IF to_regprocedure('public.iot_check_alerts()') IS NULL THEN

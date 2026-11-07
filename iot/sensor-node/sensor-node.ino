@@ -2,31 +2,92 @@
   Sensor node (tier 1)
   Board    : ESP32 Dev Module
   Core     : esp32 by Espressif Systems 3.3.12
-  Libraries: DHT sensor library, Adafruit Unified Sensor, ArduinoJson
+  Libraries: DHT sensor library, Adafruit Unified Sensor, PubSubClient, ArduinoJson
   Serial   : 115200 baud
+  Message  : WiFi / MQTT / binary frame
 
-  Reads its sensors and sends a reading to the region's edge device over the router's WiFi, once a
-  minute, and straight away if something looks wrong. The edge device passes it on to Supabase.
-  The node only decides when to send. What counts as a threat is decided on the server (017).
-  It has no actuators and no GPS. iot/README.md has the wiring and how to flash it.
+  Reads its sensors and sends a reading to the region's edge device (Mosquitto on the edge VM)
+  once a minute, and straight away when something changes. The edge passes it on to Supabase.
+  The node only decides when to send. What counts as a threat is decided on the server.
+  Readings taken while the edge can't be reached are kept in RAM (the last 30) and sent in
+  order once it is back. It has no GPS; its position is set by hand in secrets.h.
+  Nothing is kept across a restart: the beep starts on and the ultrasonic baseline is
+  measured again at every power-up.
 
-  The pins and the soil and rain numbers come from iot/testing/esp32-thing-standalone. The MPU 6050
-  and the PIR haven't been tried on the board yet, so turn them off below if yours doesn't have them.
+  Settings (router WiFi, node ID, edge address, node secret and position) are in secrets.h,
+  next to this file.
+
+  Sends straight away (at most once every 5 s) when one of these starts:
+    PIR motion                      animal / person near the node
+    ultrasonic shift > 10 cm        node moved, fell or is obstructed  (holds for 3 checks, 1 s apart)
+    ultrasonic echo lost            sensor blocked, tilted or out of range  (holds for 3 checks)
+    soil >= 85 %                    saturated soil, flash-flood risk  (checked every 10 s)
+    rain >= 60 %                    heavy rain  (checked every 10 s)
+  Each fires once when the condition starts, not again until it has cleared.
+
+  Topics (field/<node_id>/...)
+    telemetry  node -> edge   binary frame below, QoS 0
+    status     node -> edge   {"online":true|false,"boot_id":n}, retained; false is the last will
+    info       node -> edge   {"boot_id":n,"lat":..,"lon":..}, retained, once per power-up
+    cmd        edge -> node   {"id":"..","cmd":"beep_on" | "beep_off" | "reset_baseline"}
+    ack        node -> edge   {"id","cmd","ok","detail","beep_on","baseline_cm"}
+
+  Binary frame (little-endian, must match FRAME in iot/edge-device/edge_db.py):
+    offset size field     encoding
+      0     4   seq       uint32 counter since power-up
+      4     4   ts        uint32 Unix seconds UTC, 0 = clock not set yet
+      8     2   temp      int16  0.1 C,   -32768 = DHT11 read failed
+     10     1   hum       uint8  %RH,     255 = DHT11 read failed
+     11     2   soil_raw  uint16 ADC 0-4095
+     13     2   rain_raw  uint16 ADC 0-4095
+     15     2   dist      uint16 mm,      65535 = no echo
+     17     2   baseline  uint16 mm,      65535 = not set
+     19     1   rssi      int8   dBm,     0 = WiFi not connected
+     20     1   flags     bit 0 = beep on, bit 1 = PIR motion since the previous
+                          reading, other bits 0
+
+  Applications
+    DHT11      -> air temperature and humidity
+    Soil probe -> flash flooding (saturated soil) / soil drying (erosion risk)
+    Rain pad   -> rain detection
+    HC-SR04    -> node status (if the node dropped or moved)
+    PIR        -> movement near the node (animal / person)
+    Buzzer     -> asset tracking (beeps every 5 s so the node can be found)
+
+  Wiring (expansion board header: G = GND, V = supply, S = signal)
+    Device        Pin        Board header
+    DHT11         +          D21 (V)       voltage jumper on 3.3 V
+                  OUT        D21 (S)
+                  -          D21 (G)
+    Soil probe    AO         VP/36 (S)
+                  VCC        D17 (S)       switched: powered only while sampling
+                  GND        VP/36 (G)
+    Rain pad      AO         VN/39 (S)
+                  VCC        D19 (S)       switched: powered only while sampling
+                  GND        VN/39 (G)
+    HC-SR04       VCC        5V pin
+                  Trig       D5 (S)
+                  Echo       D16 (S)       (recommended: via 1k/2k divider)
+                  GND        D16 (G)
+    Buzzer        +          D23 (S)
+                  -          D23 (G)
+    PIR HC-SR501  VCC        5V pin        (needs 4.5-20 V; output is 3.3 V, safe for the ESP32)
+                  OUT        D27 (S)       jumper on H (repeat trigger), time pot fully left (~3 s)
+                  GND        D27 (G)
 */
 
-#include <DHT.h>
-#include <HTTPClient.h>
 #include <WiFi.h>
-#include <Wire.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <DHT.h>
 #include <math.h>
+#include <time.h>
 
 #include "secrets.h"
 
-// Which parts this node has. A part that's turned off is left out of the reading.
-#define HAS_MPU6050 1
-#define HAS_PIR     1
-#define HAS_BATTERY 1
+const char*    TOPIC_PREFIX = "field";
+const uint16_t MQTT_PORT    = 1883;
+const char*    MQTT_USER    = "thing";   // same user for every node; NODE_SECRET is its password
 
 // pin map
 #define DHT_PIN        21
@@ -35,56 +96,100 @@
 #define RAIN_AO_PIN    39   // VN, ADC1
 #define RAIN_PWR_PIN   19
 #define US_TRIG_PIN     5
-#define US_ECHO_PIN    16   // through a 1k/2k divider, which is required
+#define US_ECHO_PIN    16
+#define BUZZER_PIN     23
 #define PIR_PIN        27
-#define BATTERY_PIN    34   // ADC1, through a 100k/100k divider
-#define MPU_SDA_PIN    25   // not the default 21, because the DHT11 is on that
-#define MPU_SCL_PIN    26
-#define MPU_ADDRESS  0x68
 
 // timing
-const uint32_t REPORT_MS    = 60000;  // a reading every minute
-const uint32_t CHECK_MS     = 20;     // how often to look at the MPU 6050 and PIR, so a knock isn't missed
-const uint32_t DISTANCE_CHECK_MS = 1000;  // the ultrasonic can block for 30 ms, so it goes slower
-const uint32_t ALERT_GAP_MS = 5000;   // the soonest a problem can send another reading
-const int SEND_TRIES        = 3;      // the edge device can be busy sending for a few seconds
-const uint32_t SEND_GAP_MS  = 2000;
+const uint32_t REPORT_MS         = 60000;  // a routine reading every minute
+const uint32_t ALERT_GAP_MS      = 5000;   // the soonest an event can send another reading
+const uint32_t DISTANCE_CHECK_MS = 1000;   // pulseIn can block ~30 ms, so not every loop
+const uint32_t PROBE_CHECK_MS    = 10000;  // soil and rain probes, powered only while read
+const uint32_t MQTT_RETRY_MS     = 5000;
+const uint32_t BEEP_MS           = 5000;   // asset-tracking beep every 5 s (when enabled)
+const uint16_t BEEP_HZ           = 2000;
+const uint16_t BEEP_LEN_MS       = 150;
+const uint32_t PIR_WARMUP_MS     = 60000;  // ignore the PIR while it settles after power-up
 
-// calibration (tune)
+// Calibration (tune)
 const int SOIL_DRY_RAW = 4095;
 const int SOIL_WET_RAW = 1400;
 const int RAIN_DRY_RAW = 4095;
 const int RAIN_WET_RAW = 1500;
-const unsigned long US_TIMEOUT = 30000;  // ~5 m round trip max
-// A full battery and an empty one, measured at the battery, for a single cell lithium battery
-const float BATTERY_FULL_V  = 4.2;
-const float BATTERY_EMPTY_V = 3.3;
-const float BATTERY_DIVIDER = 2.0;
 
-// Past these the node sends straight away instead of waiting for the next minute. They match the
-// starting values in iot_alert_limits, but the server's numbers are the ones that raise alerts.
-const float SEND_NOW_TILT_DEGREES = 30.0;
-const float SEND_NOW_SHOCK_G      = 2.5;
-const float SEND_NOW_DISTANCE_CM  = 10.0;
+// Thresholds. The node uses these to decide when to send and for the printout. They match the
+// starting values on the server, but the server's numbers are the ones that raise alerts.
+const int SOIL_FLOOD_PCT = 85;  // at or above: saturated -> flash-flood risk   (sends now)
+const int SOIL_DRY_PCT   = 20;  // at or below: drying -> erosion risk         (printout only)
+const int RAIN_LIGHT_PCT = 20;  //                                             (printout only)
+const int RAIN_HEAVY_PCT = 60;  //                                             (sends now)
+const int PROBE_HYST_PCT = 5;   // must drop this far below a threshold before it can fire again
 
-// With the range set to 16 g, one g reads as this many counts
-const float MPU_COUNTS_PER_G = 2048.0;
+// Ultrasonic
+const float    US_MOVE_CM = 10.0;          // change from the baseline that counts as moved
+const uint8_t  US_CONFIRM = 3;             // checks in a row before a change counts
+const unsigned long US_TIMEOUT = 30000;    // ~5 m round trip max
+
+// Binary frame
+const size_t   FRAME_LEN = 21;
+const int16_t  TEMP_NONE = INT16_MIN;
+const uint8_t  HUM_NONE  = 0xFF;
+const uint16_t DIST_NONE = 0xFFFF;
+
+// Readings held while the edge can't be reached
+const uint8_t HELD_MAX       = 30;         // 30 x 1 min = ~30 min of readings, ~1 kB of RAM
+const uint8_t FLUSH_PER_LOOP = 10;
+
+enum UsState : uint8_t { US_OK, US_MOVED, US_LOST };
 
 // globals
 DHT dht(DHT_PIN, DHT11);
-uint32_t lastReport = 0, lastCheck = 0, lastDistanceCheck = 0, lastAlertSend = 0;
-float usBaseline = -1;
-float baseX = 0, baseY = 0, baseZ = 0;  // which way down was when the node started
-bool mpuWorks = false;
-float peakShock = 0;   // the hardest knock since the last reading
-bool sawMotion = false;
-bool pirWasOn = false;
-bool wasTilted = false;
-bool distanceWasOff = false;
-bool sendWanted = false;  // something looked wrong, and it's waiting for ALERT_GAP_MS
-char bootId[9];        // a new one each start, so reading IDs never repeat after a restart
-uint32_t sequence = 0;
+WiFiClient net;
+PubSubClient mqtt(net);
 
+uint32_t bootId = 0, seq = 0;
+uint32_t lastReport = 0, lastAlertSend = 0, lastDistanceCheck = 0, lastProbeCheck = 0;
+uint32_t lastBeep = 0, lastMqttTry = 0;
+float usBaseline = -1;                // cm, -1 = not set
+bool beepOn = true;
+bool wifiWasUp = false;
+bool statusSent = false;              // the edge knows our boot_id on this connection
+bool infoSent = false;                // position sent for this power-up
+IPAddress edgeIp;
+bool edgeIpKnown = false;
+char topicTelemetry[64], topicStatus[64], topicCmd[64], topicAck[64], topicInfo[64];
+char recentCmds[8][40];               // ids of the last commands, to ignore repeats
+uint8_t recentIdx = 0;
+
+// events
+volatile bool pirEdge = false;        // set by the PIR interrupt on each rising edge
+bool pirReady = false;                // warm-up over
+bool sawMotion = false;               // motion since the previous reading
+UsState usState = US_OK, usCandidate = US_OK;
+uint8_t usCount = 0;
+bool soilWasWet = false, rainWasHeavy = false;
+bool sendWanted = false;
+char sendReason[64] = "";
+
+// held readings: packed frames in a ring buffer, oldest at heldHead
+uint8_t  heldFrame[HELD_MAX][FRAME_LEN];
+uint32_t heldTakenMs[HELD_MAX];       // millis() when taken, to work out ts if the clock was set later
+uint8_t  heldHead = 0, heldCount = 0;
+uint32_t droppedTotal = 0;            // oldest readings pushed out while the buffer was full
+bool backlog = false;                 // readings had to wait; report when they are all out
+
+void IRAM_ATTR onPir() { pirEdge = true; }
+
+// Asks for a reading straight away, with the reason shown in the printout
+void requestSend(const char* why) {
+  Serial.printf("Event    : %s\n", why);
+  sendWanted = true;
+  if (strstr(sendReason, why)) return;
+  if (sendReason[0]) strlcat(sendReason, ", ", sizeof(sendReason));
+  strlcat(sendReason, why, sizeof(sendReason));
+}
+
+// ---------------------------------------------------------------- sensors
 // Power a probe, wait for it to settle, average 16 ADC readings, power it off.
 int readSwitchedSensor(uint8_t pwrPin, uint8_t aoPin) {
   digitalWrite(pwrPin, HIGH);
@@ -110,223 +215,393 @@ float readDistanceCm() {
   return us * 0.0343f / 2.0f;
 }
 
-// How far the distance has moved since the first good reading, or -1 if there's no echo
-float readDistanceChangeCm() {
-  float d = readDistanceCm();
-  if (d < 0) return -1;
-  if (usBaseline < 0) usBaseline = d;   // first good reading becomes the reference
-  return fabs(d - usBaseline);
+uint16_t cmToMm(float cm) {
+  if (cm < 0) return DIST_NONE;
+  long mm = lroundf(cm * 10.0f);
+  return (uint16_t)constrain(mm, 0L, 65534L);
 }
 
-#if HAS_MPU6050
-void writeMpuRegister(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(MPU_ADDRESS);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
+bool clockSet() { return time(nullptr) > 1704067200; }   // after 2024-01-01
+
+// The first good reading after power-up, or after reset_baseline, becomes the reference.
+void takeBaselineIfUnset(float cm) {
+  if (cm < 0 || usBaseline >= 0) return;
+  usBaseline = cmToMm(cm) / 10.0f;
+  Serial.printf("Distance : new baseline %.1f cm\n", usBaseline);
 }
 
-// High byte first. Two reads in one expression could run in either order.
-int16_t readMpuWord() {
-  uint8_t high = Wire.read();
-  uint8_t low = Wire.read();
-  return (int16_t)((high << 8) | low);
-}
-
-bool readAcceleration(float &x, float &y, float &z) {
-  Wire.beginTransmission(MPU_ADDRESS);
-  Wire.write(0x3B);  // the first acceleration register
-  if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom(MPU_ADDRESS, 6) != 6) return false;
-  x = readMpuWord() / MPU_COUNTS_PER_G;
-  y = readMpuWord() / MPU_COUNTS_PER_G;
-  z = readMpuWord() / MPU_COUNTS_PER_G;
-  return true;
-}
-
-void startMpu() {
-  Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
-  writeMpuRegister(0x6B, 0x00);  // wake it up
-  writeMpuRegister(0x1C, 0x18);  // range of 16 g
-  delay(100);
-  mpuWorks = readAcceleration(baseX, baseY, baseZ);
-  if (!mpuWorks) Serial.println("MPU 6050 : read FAILED, so no tilt or shock (check wiring)");
-}
-
-// The angle between which way down is now and which way it was at the start, so the node can be
-// mounted at any angle.
-float tiltFrom(float x, float y, float z) {
-  float size = sqrt(x * x + y * y + z * z) * sqrt(baseX * baseX + baseY * baseY + baseZ * baseZ);
-  if (size == 0) return 0;
-  float cosine = (x * baseX + y * baseY + z * baseZ) / size;
-  return acos(constrain(cosine, -1.0f, 1.0f)) * 180.0f / PI;
-}
-#endif
-
-#if HAS_BATTERY
-int readBatteryPercent() {
-  uint32_t millivolts = 0;
-  for (int i = 0; i < 16; i++) millivolts += analogReadMilliVolts(BATTERY_PIN);
-  float volts = (millivolts / 16.0f) / 1000.0f * BATTERY_DIVIDER;
-  float percent = (volts - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V) * 100.0f;
-  return constrain((int)percent, 0, 100);
-}
-#endif
-
-void sendReading() {
-  JsonDocument doc;
-  char readingId[64];
-  sequence++;
-  snprintf(readingId, sizeof(readingId), "%s-%s-%lu", NODE_ID, bootId, (unsigned long)sequence);
-  doc["node_id"] = NODE_ID;
-  doc["reading_id"] = readingId;
-
-  // A sensor that fails is left out, so the rest of the reading still counts
-  float humidity = dht.readHumidity();
-  float temperature = dht.readTemperature();
-  if (!isnan(temperature)) doc["temperature_c"] = temperature;
-  else Serial.println("DHT11 : read FAILED (check wiring)");
-  if (!isnan(humidity)) doc["humidity_percent"] = humidity;
-
-  doc["soil_moisture_percent"] =
-    rawToPercent(readSwitchedSensor(SOIL_PWR_PIN, SOIL_AO_PIN), SOIL_DRY_RAW, SOIL_WET_RAW);
-  doc["rain_percent"] =
-    rawToPercent(readSwitchedSensor(RAIN_PWR_PIN, RAIN_AO_PIN), RAIN_DRY_RAW, RAIN_WET_RAW);
-
-  float distanceChange = readDistanceChangeCm();
-  if (distanceChange >= 0) doc["distance_change_cm"] = min(distanceChange, 500.0f);
-  else Serial.println("HC-SR04 : no echo");
-
-#if HAS_MPU6050
-  float x, y, z;
-  if (mpuWorks && readAcceleration(x, y, z)) {
-    doc["tilt_degrees"] = tiltFrom(x, y, z);
-    doc["shock_g"] = min(max(peakShock, sqrtf(x * x + y * y + z * z)), 32.0f);
+// ---------------------------------------------------------------- event checks
+void checkPir() {
+  if (!pirReady) {
+    if (millis() < PIR_WARMUP_MS) { pirEdge = false; return; }
+    pirReady = true;
+    pirEdge = false;
+    Serial.println("PIR      : warmed up");
   }
-#endif
-
-#if HAS_PIR
-  doc["motion_detected"] = sawMotion;
-#endif
-
-#if HAS_BATTERY
-  doc["battery_percent"] = readBatteryPercent();
-#endif
-
-  String body;
-  serializeJson(doc, body);
-  Serial.println(body);
-
-  for (int attempt = 1; attempt <= SEND_TRIES; attempt++) {
-    if (WiFi.status() == WL_CONNECTED) {
-      HTTPClient http;
-      http.begin(EDGE_URL);
-      http.setTimeout(5000);
-      http.addHeader("Content-Type", "application/json");
-      http.addHeader("X-Node-Secret", NODE_SECRET);
-      int status = http.POST(body);
-      http.end();
-      if (status == 200) {
-        peakShock = 0;
-        sawMotion = false;
-        return;
-      }
-      Serial.printf("Edge device answered %d (try %d)\n", status, attempt);
-      // It read the message and turned it down, so sending it again won't help
-      if (status >= 400 && status < 500) return;
-    } else {
-      Serial.printf("No WiFi (try %d)\n", attempt);
-    }
-    delay(SEND_GAP_MS);
+  if (pirEdge) {
+    pirEdge = false;
+    sawMotion = true;
+    requestSend("motion");
   }
-  // The node doesn't keep readings. The edge device is what buffers them, and it should be up even
-  // when the internet isn't. Keep the knock and the motion for the next reading.
-  Serial.println("Couldn't reach the edge device, so this reading is lost");
-}
-
-// Looks at the sensors that can spot a problem. A problem asks for one reading when it starts, not
-// one every few seconds for as long as it lasts, or a fallen node would flatten its battery.
-void checkFastSensors() {
-#if HAS_MPU6050
-  float x, y, z;
-  if (mpuWorks && readAcceleration(x, y, z)) {
-    float shock = sqrtf(x * x + y * y + z * z);
-    if (shock > peakShock) peakShock = shock;
-    if (shock > SEND_NOW_SHOCK_G) sendWanted = true;
-
-    bool tilted = tiltFrom(x, y, z) > SEND_NOW_TILT_DEGREES;
-    if (tilted && !wasTilted) sendWanted = true;
-    wasTilted = tilted;
-  }
-#endif
-
-#if HAS_PIR
-  bool pirOn = digitalRead(PIR_PIN) == HIGH;
-  if (pirOn) sawMotion = true;
-  if (pirOn && !pirWasOn) sendWanted = true;
-  pirWasOn = pirOn;
-#endif
 }
 
 void checkDistance() {
-  float change = readDistanceChangeCm();
-  bool off = change > SEND_NOW_DISTANCE_CM;   // -1 means no echo, which doesn't count
-  if (off && !distanceWasOff) sendWanted = true;
-  distanceWasOff = off;
+  float cm = readDistanceCm();
+  UsState seen = US_LOST;
+  if (cm >= 0) {
+    takeBaselineIfUnset(cm);
+    seen = fabsf(cm - usBaseline) > US_MOVE_CM ? US_MOVED : US_OK;
+  }
+  // A change only counts once it has held for US_CONFIRM checks in a row
+  if (seen == usCandidate) { if (usCount < US_CONFIRM) usCount++; }
+  else { usCandidate = seen; usCount = 1; }
+
+  if (usCount >= US_CONFIRM && usCandidate != usState) {
+    usState = usCandidate;
+    if (usState == US_MOVED)     requestSend("node moved");
+    else if (usState == US_LOST) requestSend("echo lost");
+    else Serial.println("Event    : distance back to normal");
+  }
 }
 
+void checkProbes() {
+  int soilPct = rawToPercent(readSwitchedSensor(SOIL_PWR_PIN, SOIL_AO_PIN), SOIL_DRY_RAW, SOIL_WET_RAW);
+  int rainPct = rawToPercent(readSwitchedSensor(RAIN_PWR_PIN, RAIN_AO_PIN), RAIN_DRY_RAW, RAIN_WET_RAW);
+  bool soilWet   = soilPct >= SOIL_FLOOD_PCT - (soilWasWet   ? PROBE_HYST_PCT : 0);
+  bool rainHeavy = rainPct >= RAIN_HEAVY_PCT - (rainWasHeavy ? PROBE_HYST_PCT : 0);
+  if (soilWet && !soilWasWet)     requestSend("soil saturated");
+  if (rainHeavy && !rainWasHeavy) requestSend("heavy rain");
+  soilWasWet = soilWet;
+  rainWasHeavy = rainHeavy;
+}
+
+// ---------------------------------------------------------------- binary out
+void put16(uint8_t* p, uint16_t v) { p[0] = v & 0xFF; p[1] = v >> 8; }
+void put32(uint8_t* p, uint32_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = v >> 24; }
+
+uint32_t get32(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Every reading goes into the buffer first, so readings always leave in order.
+void holdFrame(const uint8_t* frame) {
+  if (heldCount == HELD_MAX) {         // full: the oldest makes room
+    heldHead = (heldHead + 1) % HELD_MAX;
+    heldCount--;
+    droppedTotal++;
+  }
+  uint8_t slot = (heldHead + heldCount) % HELD_MAX;
+  memcpy(heldFrame[slot], frame, FRAME_LEN);
+  heldTakenMs[slot] = millis();
+  heldCount++;
+}
+
+// Sends held readings, oldest first, while the edge is reachable.
+void flushHeld() {
+  if (!statusSent || !mqtt.connected()) return;
+  for (uint8_t sent = 0; heldCount && sent < FLUSH_PER_LOOP; sent++) {
+    uint8_t* frame = heldFrame[heldHead];
+    if (get32(frame + 4) == 0 && clockSet())   // taken before NTP answered: work out when it was taken
+      put32(frame + 4, (uint32_t)time(nullptr) - (millis() - heldTakenMs[heldHead]) / 1000);
+    if (!mqtt.publish(topicTelemetry, frame, FRAME_LEN, false)) return;
+    heldHead = (heldHead + 1) % HELD_MAX;
+    heldCount--;
+  }
+}
+
+// ---------------------------------------------------------------- one reading
+void sampleAll(const char* why) {
+  seq++;
+  uint32_t ts   = clockSet() ? (uint32_t)time(nullptr) : 0;   // 0 = unknown, the edge then uses its own clock
+  int8_t   rssi = (WiFi.status() == WL_CONNECTED) ? (int8_t)WiFi.RSSI() : 0;
+  uint8_t  flags = beepOn ? 1 : 0;
+
+  // PIR: movement at any moment since the previous reading (the interrupt catches short
+  // pulses between readings; the pin level covers a pulse still going on)
+  bool motion = pirReady && (sawMotion || digitalRead(PIR_PIN) == HIGH);
+  sawMotion = false;
+  if (motion) flags |= 2;
+
+  Serial.printf("\n---- #%lu (t = %lu s, %s) ----\n", (unsigned long)seq, (unsigned long)(millis() / 1000), why);
+
+  // DHT11: temperature and humidity
+  int16_t temp10 = TEMP_NONE;
+  uint8_t humPct = HUM_NONE;
+  float hum = dht.readHumidity();
+  float temp = dht.readTemperature();
+  if (isnan(hum) || isnan(temp)) {
+    Serial.println("Temp/Hum : read FAILED (check DHT11 wiring)");
+  } else {
+    temp10 = (int16_t)constrain(lroundf(temp * 10.0f), -400L, 850L);
+    humPct = (uint8_t)constrain(lroundf(hum), 0L, 100L);
+    Serial.printf("Temp/Hum : %.1f C   %u %%RH\n", temp10 / 10.0f, humPct);
+  }
+
+  // Soil moisture: flooding / drying
+  uint16_t soilRaw = readSwitchedSensor(SOIL_PWR_PIN, SOIL_AO_PIN);
+  int soilPct = rawToPercent(soilRaw, SOIL_DRY_RAW, SOIL_WET_RAW);
+  Serial.printf("Soil     : raw %4u -> %3d %%   [%s]\n", soilRaw, soilPct,
+                soilPct >= SOIL_FLOOD_PCT ? "SATURATED" : soilPct <= SOIL_DRY_PCT ? "DRY" : "NORMAL");
+
+  // Rain
+  uint16_t rainRaw = readSwitchedSensor(RAIN_PWR_PIN, RAIN_AO_PIN);
+  int rainPct = rawToPercent(rainRaw, RAIN_DRY_RAW, RAIN_WET_RAW);
+  Serial.printf("Rain     : raw %4u -> %3d %%   [%s]\n", rainRaw, rainPct,
+                rainPct >= RAIN_HEAVY_PCT ? "HEAVY" : rainPct >= RAIN_LIGHT_PCT ? "RAIN" : "NONE");
+
+  // Ultrasonic: node status (to 1 mm, the resolution of the frame)
+  float cm = readDistanceCm();
+  takeBaselineIfUnset(cm);
+  uint16_t distMm = cmToMm(cm);
+  if (distMm == DIST_NONE) {
+    Serial.println("Distance : no echo   [CHECK NODE - sensor blocked, tilted or out of range]");
+  } else {
+    long deltaMm = (long)distMm - (long)cmToMm(usBaseline);
+    bool moved = labs(deltaMm) > lroundf(US_MOVE_CM * 10.0f);
+    Serial.printf("Distance : %.1f cm  (baseline %.1f, change %+.1f)   [%s]\n",
+                  distMm / 10.0f, usBaseline, deltaMm / 10.0f, moved ? "NODE MOVED / OBSTRUCTED" : "NODE OK");
+  }
+  uint16_t baseMm = cmToMm(usBaseline);
+
+  Serial.printf("Motion   : %s\n", !pirReady ? "PIR warming up" : motion ? "MOVEMENT DETECTED" : "none");
+
+  // Pack the frame (layout in the header above)
+  uint8_t frame[FRAME_LEN];
+  put32(frame + 0, seq);
+  put32(frame + 4, ts);
+  put16(frame + 8, (uint16_t)temp10);
+  frame[10] = humPct;
+  put16(frame + 11, soilRaw);
+  put16(frame + 13, rainRaw);
+  put16(frame + 15, distMm);
+  put16(frame + 17, baseMm);
+  frame[19] = (uint8_t)rssi;
+  frame[20] = flags;
+
+  holdFrame(frame);
+  flushHeld();
+  if (heldCount == 0) {
+    Serial.println("MQTT     : sent");
+  } else {
+    backlog = true;
+    if (statusSent && mqtt.connected())
+      Serial.printf("MQTT     : sending held readings, %u left\n", heldCount);
+    else
+      Serial.printf("MQTT     : edge not reachable, reading held (%u waiting%s)\n", heldCount,
+                    heldCount == HELD_MAX ? ", full: the oldest are being dropped" : "");
+  }
+}
+
+// ---------------------------------------------------------------- commands in
+bool seenBefore(const char* id) {
+  for (auto& r : recentCmds) if (strcmp(r, id) == 0) return true;
+  strlcpy(recentCmds[recentIdx], id, sizeof(recentCmds[0]));
+  recentIdx = (recentIdx + 1) % 8;
+  return false;
+}
+
+void sendAck(const char* id, const char* cmd, bool ok, const char* detail) {
+  JsonDocument doc;
+  doc["id"] = id;
+  doc["cmd"] = cmd;
+  doc["ok"] = ok;
+  doc["detail"] = detail;
+  doc["beep_on"] = beepOn;
+  if (usBaseline < 0) doc["baseline_cm"] = nullptr; else doc["baseline_cm"] = serialized(String(usBaseline, 1));
+  char out[256];
+  size_t n = serializeJson(doc, out, sizeof(out));
+  mqtt.publish(topicAck, (const uint8_t*)out, n, false);
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("Command  : not valid JSON, ignored");
+    return;
+  }
+  char id[40], cmd[24];                // copy out before publishing (shared buffer)
+  strlcpy(id, doc["id"] | "", sizeof(id));
+  strlcpy(cmd, doc["cmd"] | "", sizeof(cmd));
+  if (id[0] == 0) return;
+
+  if (seenBefore(id)) {                // the edge resent it: just confirm again
+    sendAck(id, cmd, true, "repeat, already done");
+    return;
+  }
+  Serial.printf("Command  : %s (%.8s)\n", cmd, id);
+  if (strcmp(cmd, "beep_on") == 0) {
+    beepOn = true;
+    lastBeep = millis() - BEEP_MS;     // beep straight away
+    sendAck(id, cmd, true, "beep enabled");
+  } else if (strcmp(cmd, "beep_off") == 0) {
+    beepOn = false;
+    noTone(BUZZER_PIN);
+    sendAck(id, cmd, true, "beep disabled");
+  } else if (strcmp(cmd, "reset_baseline") == 0) {
+    usBaseline = -1;
+    usState = usCandidate = US_OK;     // start the moved / lost checks fresh
+    usCount = 0;
+    sendAck(id, cmd, true, "baseline cleared, next good reading becomes the reference");
+  } else {
+    sendAck(id, cmd, false, "unknown command");
+  }
+}
+
+// ---------------------------------------------------------------- network
+void handleWifi() {
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up && !wifiWasUp) {
+    Serial.printf("WiFi     : connected to %s, IP %s, RSSI %d dBm\n", WIFI_SSID, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    edgeIpKnown = false;
+  } else if (!up && wifiWasUp) {
+    Serial.println("WiFi     : disconnected, reconnecting...");
+  }
+  wifiWasUp = up;
+}
+
+bool resolveEdge() {
+  if (edgeIpKnown) return true;
+  IPAddress ip;
+  String host = EDGE_HOST;
+  if (ip.fromString(host)) {
+    edgeIp = ip;
+  } else if (!WiFi.hostByName(EDGE_HOST, edgeIp)) {
+    Serial.printf("MQTT     : cannot resolve %s\n", EDGE_HOST);
+    return false;
+  }
+  edgeIpKnown = true;
+  Serial.printf("MQTT     : edge %s is %s\n", EDGE_HOST, edgeIp.toString().c_str());
+  return true;
+}
+
+void ensureMqtt() {
+  if (!mqtt.connected()) statusSent = false;
+  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastMqttTry < MQTT_RETRY_MS) return;   // readings continue meanwhile
+  lastMqttTry = millis();
+  if (!resolveEdge()) return;
+
+  mqtt.setServer(edgeIp, MQTT_PORT);
+  char clientId[48], will[64], online[64];
+  snprintf(clientId, sizeof(clientId), "thing-%s", NODE_ID);
+  snprintf(will, sizeof(will), "{\"online\":false,\"boot_id\":%lu}", (unsigned long)bootId);
+  if (mqtt.connect(clientId, MQTT_USER, NODE_SECRET, topicStatus, 1, true, will)) {
+    // The edge takes the boot_id for every following frame from this message, so
+    // telemetry waits until it is out (sent in order on the same connection).
+    snprintf(online, sizeof(online), "{\"online\":true,\"boot_id\":%lu}", (unsigned long)bootId);
+    if (!mqtt.publish(topicStatus, online, true)) {
+      Serial.println("MQTT     : could not send the status message, reconnecting");
+      mqtt.disconnect();
+      return;
+    }
+    statusSent = true;
+    if (!infoSent) {                   // once per power-up: where this node is
+      char info[128], lat[16] = "null", lon[16] = "null";
+      if (!isnan(NODE_LAT)) snprintf(lat, sizeof(lat), "%.6f", NODE_LAT);
+      if (!isnan(NODE_LON)) snprintf(lon, sizeof(lon), "%.6f", NODE_LON);
+      snprintf(info, sizeof(info), "{\"boot_id\":%lu,\"lat\":%s,\"lon\":%s}", (unsigned long)bootId, lat, lon);
+      infoSent = mqtt.publish(topicInfo, info, true);
+    }
+    mqtt.subscribe(topicCmd, 1);
+    Serial.printf("MQTT     : connected to %s:%u as %s\n", edgeIp.toString().c_str(), MQTT_PORT, MQTT_USER);
+  } else {
+    // -2 = edge not reachable (VM off / wrong IP / port 1883 blocked), 4 = wrong user or password, 5 = not authorised
+    Serial.printf("MQTT     : connect failed (state %d), retrying in 5 s\n", mqtt.state());
+    edgeIpKnown = false;               // look the address up again next time
+  }
+}
+
+// ---------------------------------------------------------------- setup / loop
 void setup() {
   Serial.begin(115200);
 
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db); // 0 - ~3.1 V input range
+  analogSetAttenuation(ADC_11db);      // 0 - ~3.1 V input range
 
   pinMode(SOIL_PWR_PIN, OUTPUT);  digitalWrite(SOIL_PWR_PIN, LOW);
   pinMode(RAIN_PWR_PIN, OUTPUT);  digitalWrite(RAIN_PWR_PIN, LOW);
   pinMode(US_TRIG_PIN, OUTPUT);   digitalWrite(US_TRIG_PIN, LOW);
   pinMode(US_ECHO_PIN, INPUT);
-#if HAS_PIR
-  pinMode(PIR_PIN, INPUT);
-#endif
+  pinMode(PIR_PIN, INPUT_PULLDOWN);    // pull-down: an unplugged PIR reads "no motion"
+  attachInterrupt(digitalPinToInterrupt(PIR_PIN), onPir, RISING);
 
-  dht.begin();
-  delay(2000);  // DHT11 needs ~1-2 s after power-up
-
-#if HAS_MPU6050
-  startMpu();
-#endif
-
-  snprintf(bootId, sizeof(bootId), "%08lx", (unsigned long)esp_random());
+  snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/%s/telemetry", TOPIC_PREFIX, NODE_ID);
+  snprintf(topicStatus, sizeof(topicStatus), "%s/%s/status", TOPIC_PREFIX, NODE_ID);
+  snprintf(topicCmd, sizeof(topicCmd), "%s/%s/cmd", TOPIC_PREFIX, NODE_ID);
+  snprintf(topicAck, sizeof(topicAck), "%s/%s/ack", TOPIC_PREFIX, NODE_ID);
+  snprintf(topicInfo, sizeof(topicInfo), "%s/%s/info", TOPIC_PREFIX, NODE_ID);
+  memset(recentCmds, 0, sizeof(recentCmds));
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  bootId = esp_random();               // new random id every power-up (radio on = true random)
+  configTime(0, 0, "pool.ntp.org", "time.google.com");   // UTC; the edge converts for display
 
-  Serial.printf("\nSensor node %s started\n", NODE_ID);
-  lastReport = millis() - REPORT_MS;  // send the first reading once WiFi is up
+  mqtt.setBufferSize(256);             // a frame, a command or the info message
+  mqtt.setKeepAlive(30);
+  mqtt.setSocketTimeout(5);
+  mqtt.setCallback(onMqttMessage);
+
+  dht.begin();
+  delay(2000);  // DHT11 needs ~1-2 s after power-up
+
+  Serial.printf("\nESP32 field node %s started (boot_id %lu, beep on, baseline taken from the first good reading)\n",
+                NODE_ID, (unsigned long)bootId);
+  if (isnan(NODE_LAT) || isnan(NODE_LON)) Serial.println("Position : NODE_LAT / NODE_LON not set, recorded as empty");
+  else Serial.printf("Position : %.6f, %.6f\n", NODE_LAT, NODE_LON);
+  Serial.printf("PIR      : warming up for %lu s\n", (unsigned long)(PIR_WARMUP_MS / 1000));
+
+  uint32_t now = millis();
+  lastReport        = now - REPORT_MS;          // first reading straight away (held until MQTT is up)
+  lastAlertSend     = now - ALERT_GAP_MS;
+  lastDistanceCheck = now - DISTANCE_CHECK_MS;
+  lastProbeCheck    = now - PROBE_CHECK_MS;
+  lastBeep          = now - BEEP_MS;
 }
 
 void loop() {
-  uint32_t now = millis();
+  handleWifi();
+  ensureMqtt();
+  mqtt.loop();
 
-  if (now - lastCheck >= CHECK_MS) {
-    lastCheck = now;
-    checkFastSensors();
+  flushHeld();
+  if (backlog && heldCount == 0) {
+    backlog = false;
+    Serial.print("MQTT     : edge reachable again, held readings sent");
+    if (droppedTotal) Serial.printf(" (%lu oldest were dropped while the buffer was full)", (unsigned long)droppedTotal);
+    Serial.println();
+    droppedTotal = 0;
   }
+
+  uint32_t now = millis();
+  checkPir();
   if (now - lastDistanceCheck >= DISTANCE_CHECK_MS) {
     lastDistanceCheck = now;
     checkDistance();
   }
+  if (now - lastProbeCheck >= PROBE_CHECK_MS) {
+    lastProbeCheck = now;
+    checkProbes();
+  }
 
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  if (sendWanted && now - lastAlertSend >= ALERT_GAP_MS) {
+  // An event sends at most every ALERT_GAP_MS; a routine reading that falls due first carries
+  // any waiting event with it.
+  now = millis();
+  bool eventDue   = sendWanted && now - lastAlertSend >= ALERT_GAP_MS;
+  bool routineDue = now - lastReport >= REPORT_MS;
+  if (eventDue || routineDue) {
+    char why[72];
+    strlcpy(why, sendWanted ? sendReason : "routine", sizeof(why));
+    if (sendWanted) lastAlertSend = now;
     sendWanted = false;
-    lastAlertSend = now;
+    sendReason[0] = 0;
     lastReport = now;
-    sendReading();
-  } else if (now - lastReport >= REPORT_MS) {
-    lastReport = now;
-    sendReading();
+    sampleAll(why);
+  }
+
+  if (beepOn && now - lastBeep >= BEEP_MS) {
+    lastBeep = now;
+    tone(BUZZER_PIN, BEEP_HZ, BEEP_LEN_MS); // non-blocking short beep
   }
 }

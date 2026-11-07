@@ -356,6 +356,12 @@
   background-color: var(--color-sheet);
 }
 
+/* A node with a routine alert (both maps) */
+.map-sensor-warn span {
+  border-color: var(--color-warn);
+  background-color: var(--color-warn);
+}
+
 .map-sensor-alert::after {
   content: "";
   position: absolute;

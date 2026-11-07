@@ -2,7 +2,14 @@
 
 import { revalidatePath } from "next/cache";
 import { getSession, SERVICE_DOWN } from "@/lib/auth";
-import { checkDeviceId, checkDeviceSwitch, checkNewDevice, checkNewNode, checkNodeLink } from "@/lib/iot";
+import {
+  checkDeviceId,
+  checkDevicePosition,
+  checkDeviceSwitch,
+  checkNewDevice,
+  checkNewNode,
+  checkNodeLink,
+} from "@/lib/iot";
 import { sqlIsMissing } from "@/lib/iot-db";
 import { authConfigured } from "@/lib/supabase/config";
 import { createClient } from "@/lib/supabase/server";
@@ -14,7 +21,7 @@ const TRY_AGAIN = "Nothing was changed. Try again, and if it keeps happening, ch
 
 /**
  * Anyone can send a request straight to a server action, so this checks who is signed in itself.
- * Row Level Security and the database functions check the role again (supabase/016).
+ * Row Level Security and the database functions check the role again (supabase/016_1 to 016_3).
  */
 async function adminProblem() {
   if (!authConfigured) return "Sensors aren’t set up on this server yet.";
@@ -37,7 +44,10 @@ function failed(error: { code?: string }, what: string, exists?: string): Device
     };
   }
   if (sqlIsMissing(error)) {
-    return { ok: false, message: "This database hasn’t been set up for sensors yet. Run 016 and 017 first." };
+    return {
+      ok: false,
+      message: "This database hasn’t been set up for sensors yet, or has an older version. Run 016_1 to 025 first.",
+    };
   }
   if (error.code === "23505" && exists) return { ok: false, message: exists };
   // Only the code. A failed token call must never put anything else about it in the logs.
@@ -161,4 +171,28 @@ export async function linkNode(input: unknown): Promise<DeviceResult> {
     return { ok: false, message: "This node isn’t in the database any more. Reload the page." };
   }
   return { ok: true, message: deviceId ? `${nodeId} now sends through ${deviceId}.` : `${nodeId} isn’t linked to a device now.` };
+}
+
+export async function setDevicePosition(input: unknown): Promise<DeviceResult> {
+  const problem = await adminProblem();
+  if (problem) return { ok: false, message: problem };
+  const checked = checkDevicePosition(input);
+  if (!checked.ok) return checked;
+
+  const { deviceId, latitude, longitude } = checked.value;
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("iot_devices")
+    .update({ latitude, longitude })
+    .eq("device_id", deviceId)
+    .select("device_id");
+  if (error) return failed(error, "Saving a device position");
+  changed();
+  if (data.length === 0) {
+    return { ok: false, message: "This device isn’t in the database any more. Reload the page." };
+  }
+  return {
+    ok: true,
+    message: latitude === null ? `${deviceId} has no position now.` : `${deviceId} is on the map now.`,
+  };
 }

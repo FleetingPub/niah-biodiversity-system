@@ -1,0 +1,62 @@
+# =============================================================================
+# Edge configuration, read by thing-com.py and cloud-com.py
+# install-edge.sh copies this to /opt/iot-edge/config.toml. Nothing in it is
+# secret: the edge ID, keys, passwords and the Supabase address are in
+# secrets.toml next to it (see secrets.example.toml).
+# After editing:  iot-edge restart
+# =============================================================================
+
+db_path = "/opt/iot-edge/data/edge.db"      # the local SQLite database
+# secrets_path = "/opt/iot-edge/secrets.toml"   # default: secrets.toml next to this file
+
+[edge]
+# Where this edge device is installed, decimal degrees WGS84 (e.g. from a phone's map app).
+# It goes to Supabase with the edge's registration: after changing it, run
+# `iot-edge register-sql` and paste the SQL again. Leave nan if unknown: it is recorded as empty.
+lat = nan                                   # e.g.   1.553300  (north +, south -)
+lon = nan                                   # e.g. 110.359200  (east +, west -)
+
+[mqtt]                                      # the Mosquitto broker on this VM
+host = "localhost"
+port = 1883
+username = "edge"                           # its password is mqtt_password in secrets.toml
+topic_prefix = "field"                      # topics are field/<node_id>/telemetry etc.
+
+[cloud]                                     # the Supabase edge-com function (address in secrets.toml)
+upload_interval_s = 60                      # how often to upload the regular readings (= the node's routine reading)
+urgent_retry_s = 10                         # how often a quick alert retries while uploads fail
+gzip = true                                 # gzip the uploads (edge-com accepts both)
+batch_size = 500                            # readings per upload (max 1000)
+retention_days = 30                         # sent readings older than this are deleted locally,
+                                            # and so are readings in a batch Supabase refused
+timeout_s = 20
+
+[commands]
+resend_after_s = 20                         # resend a command if the thing has not acknowledged it
+
+[alerts]
+# Quick alerts: when confirm_readings readings in a row show one of these
+# conditions, they are uploaded at once, first in line, without waiting for
+# upload_interval_s. Supabase decides the alerts themselves and queues the
+# notifications. types and confirm_readings are used until Supabase sends the
+# node's own values (public.nodes); quick_window_s is the edge's own.
+# Possible types: SATURATED, DRY, HEAVY, RAIN, MOVED, NO_ECHO, MOTION (PIR sensor)
+types = ["SATURATED", "HEAVY", "MOVED", "NO_ECHO", "MOTION"]
+confirm_readings = 1                        # the node sends at once when a condition starts and
+                                            # debounces it itself, so its first reading is enough
+motion_confirm_readings = 1                 # MOTION: readings in a row with movement (1 = first detection)
+quick_window_s = 300                        # the same condition on the same node gets a quick
+                                            # upload again only after this long
+
+[calibration]
+# Used for a node until Supabase sends that node's own values (table public.nodes,
+# change them there). Same defaults as schema.sql and the ESP32 sketch.
+soil_dry_raw = 4095
+soil_wet_raw = 1400
+soil_flood_pct = 85                         # at or above: SATURATED (flash-flood risk)
+soil_dry_pct = 20                           # at or below: DRY (erosion risk)
+rain_dry_raw = 4095
+rain_wet_raw = 1500
+rain_light_pct = 20                         # at or above: RAIN
+rain_heavy_pct = 60                         # at or above: HEAVY
+move_cm = 10.0                              # more than this from the baseline: MOVED

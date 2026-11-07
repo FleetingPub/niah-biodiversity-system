@@ -1,0 +1,17 @@
+[Unit]
+Description=Field node thing-com (ESP32 MQTT -> SQLite, commands down)
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=iotedge
+Group=iotedge
+WorkingDirectory=/opt/iot-edge
+ExecStart=/opt/iot-edge/venv/bin/python /opt/iot-edge/thing-com.py --config /opt/iot-edge/config.toml
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

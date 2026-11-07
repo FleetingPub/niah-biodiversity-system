@@ -9,7 +9,8 @@ the dashboard (add, edit and delete) and the public pages (home, plant list, pla
 pages) now use Supabase (items 14 to 16), and so do the dashboard records pages (item 17), the
 photos (item 18), the maps (item 20), reports (item 21), the review queue (item 19) and the
 overview's records and counts. The users page is real too (item 2), and so are the sensor pages
-(items 28 to 31). `iot/README.md` covers the hardware and the simulator.
+(items 28 to 31). [`iot/Field_Node_Edge-to-Cloud_Setup_Guide.md`](../iot/Field_Node_Edge-to-Cloud_Setup_Guide.md)
+covers the nodes, the edge devices and `edge-com`.
 
 | Side | Screens |
 | --- | --- |
@@ -87,6 +88,12 @@ accounts get "No access". The stand-in lists the accounts when it starts, and th
 `TEST_PASSWORD` in `stand-in.js`. Everything in it is made up, and it all goes when you stop it.
 [supabase/README.md](../supabase/README.md#tests) has more about it.
 
+The stand-in also runs our `edge-com` function and starts with a day of made up readings from three
+sensor nodes, so the Sensors page, its map and the overview have something to show: an urgent
+alert, a routine one, one that ended by itself and a node that's gone quiet. Start it with
+`STAND_IN_SENSOR_DATA=0` for no readings. Running `edge-com` needs Node 22.13 or newer. On an older
+Node 22 the stand-in starts without it and says so.
+
 This only works with `npm run dev`. The stand-in's URL is http, so a production build of the
 website says sign in isn't set up.
 
@@ -114,7 +121,7 @@ src/
       review/           the review queue: approve or reject records from the mobile app, and send one back
       species/          the species table, new/ to add one, and [slug]/edit and [slug]/delete
       reports/          counts, charts and the print view, and csv/ for the download
-      sensors/          alerts, the sensor nodes and their history, and devices/ for tokens (admins)
+      sensors/          alerts, the map, the sensor nodes and their history, commands, and devices/ for tokens and positions (admins)
       users/            who has an account and what each role can do
   components/           shared pieces: park map, tree tag, photo gallery, icons...
   data/                 mock species and records, plus the screen list
@@ -127,7 +134,7 @@ Still to build on the website. The item numbers match the proposal and `docs/spr
 
 | Item | What goes in | Where |
 | --- | --- | --- |
-| 32 | Sensors on the map. Alerts only show on the dashboard for now, and nothing is sent to a patrol team. | Sensors, overview |
+| 32 | Sensors on the park and overview maps. `ParkMap` already takes them, with `mapStateOf()` from `src/lib/iot.ts` for each one's look, and the Sensors page has its own map. Alerts only show on the dashboard for now, and nothing is sent to a patrol team. | Overview, park map |
 
 ## Notes for the team
 
@@ -153,10 +160,10 @@ Still to build on the website. The item numbers match the proposal and `docs/spr
   component for the same reason: everything a page gives `ParkMap` ends up in the browser, so pages
   work out the points on the server and pass rough squares from `src/lib/geo.ts`, never the points,
   for a plant whose spot is hidden.
-- The maps use Leaflet with OpenStreetMap's own tiles, which come straight from openstreetmap.org
-  into the visitor's browser. That's fine under OSM's tile policy for a student project with little
-  traffic, as long as the attribution in the corner stays. If the site ever gets real traffic it
-  should move to a tile provider that allows it.
+- The maps, the Sensors page's included, use Leaflet with OpenStreetMap's own tiles, which come
+  straight from openstreetmap.org into the visitor's browser. That's fine under OSM's tile policy
+  for a student project with little traffic, as long as the attribution in the corner stays. If
+  the site ever gets real traffic it should move to a tile provider that allows it.
 - Park HQ is `PARK_HQ` in `src/lib/geo.ts`. The maps mark it and always keep it in view, and a
   tree tag page whose plant has a public spot says how far it is from HQ ("about 130 m north of
   park HQ"). It's the same point the mobile app's mock records sit around and the simulator step

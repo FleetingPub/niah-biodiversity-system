@@ -1,0 +1,43 @@
+#!/bin/sh
+# iot-edge - shortcuts for the field-node edge (installed to /usr/local/bin by install-edge.sh)
+APP=/opt/iot-edge
+PY="$APP/venv/bin/python"
+CFG="$APP/config.toml"
+
+as_svc() {   # run as the iotedge service account, which owns the database
+  if [ "$(id -un)" = iotedge ]; then "$@"; else sudo -u iotedge "$@"; fi
+}
+
+case "$1" in
+  status)         as_svc "$PY" "$APP/cloud-com.py" --config "$CFG" --status ;;
+  alerts)         as_svc "$PY" "$APP/cloud-com.py" --config "$CFG" --alerts ;;
+  sync)           as_svc "$PY" "$APP/cloud-com.py" --config "$CFG" --once ;;
+  requeue)        as_svc "$PY" "$APP/cloud-com.py" --config "$CFG" --requeue ;;
+  register-sql)   as_svc "$PY" "$APP/cloud-com.py" --config "$CFG" --register-sql ;;
+  watch)          as_svc "$PY" "$APP/thing-com.py" --config "$CFG" --watch ;;
+  fake-thing)     shift; as_svc "$PY" "$APP/tools/fake-thing.py" --config "$CFG" "$@" ;;
+  logs)           journalctl -u thing-com -u cloud-com -f -n 50 ;;
+  restart)        sudo systemctl restart thing-com cloud-com && echo "restarted thing-com and cloud-com" ;;
+  node-secret)    sudo sed -n 's/^node_secret *= *"\(.*\)"/#define NODE_SECRET "\1"/p' "$APP/secrets.toml" ;;
+  secrets)        sudo nano "$APP/secrets.toml" ;;
+  db)             as_svc sqlite3 -header -column "$APP/data/edge.db" ;;
+  *)
+    cat <<'EOF'
+usage: iot-edge <command>
+  status          what is stored, waiting and sent; newest readings; recent commands
+  alerts          the latest quick alerts and how fast they reached Supabase
+  sync            upload to Supabase right now and show the result
+  requeue         put readings from batches Supabase refused back in the upload queue
+  logs            follow the logs of thing-com and cloud-com (Ctrl+C to stop)
+  watch           print every MQTT message from the things, frames decoded (Ctrl+C to stop)
+  fake-thing      run a simulated ESP32 (options: --node NNP-IOT-02 --interval 60 --event-gap 5
+                  --count 10 --flood-at 3 --flood-until 9 --soil-pct 90,90,70 --rain-at 3
+                  --move-at 3 --motion-at 4,5 --lat 1.5533 --lon 110.3592 --no-clock)
+  restart         restart both services after editing config.toml or secrets.toml
+  register-sql    how to register this edge in Supabase (Devices page, position SQL)
+  node-secret     show the NODE_SECRET line for the sensor nodes' secrets.h
+  secrets         edit /opt/iot-edge/secrets.toml (keys, passwords, Supabase address)
+  db              open edge.db in sqlite3 (type .quit to leave)
+EOF
+    ;;
+esac

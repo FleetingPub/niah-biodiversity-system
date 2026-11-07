@@ -57,22 +57,28 @@ export function ParkMap({
             Rough area, about 440 m across
           </span>
         )}
-        {sensors.length > 0 && (
+        {sensors.some((s) => s.state === "ok") && (
           <span className="inline-flex items-center gap-2">
             <span className="size-3 rounded-sm bg-ink" aria-hidden="true" />
-            Sensor
+            Sensor reporting
           </span>
         )}
-        {sensors.some((s) => !s.online) && (
+        {sensors.some((s) => s.state === "warning") && (
           <span className="inline-flex items-center gap-2">
-            <span className="size-3 rounded-sm border-2 border-ink bg-sheet" aria-hidden="true" />
-            Offline
+            <span className="size-3 rounded-sm bg-warn" aria-hidden="true" />
+            Routine alert
           </span>
         )}
-        {sensors.some((s) => s.alert) && (
+        {sensors.some((s) => s.state === "alert") && (
           <span className="inline-flex items-center gap-2">
             <span className="size-3.5 rounded-full border-2 border-bad" aria-hidden="true" />
-            Has an alert
+            Urgent alert
+          </span>
+        )}
+        {sensors.some((s) => s.state === "quiet") && (
+          <span className="inline-flex items-center gap-2">
+            <span className="size-3 rounded-sm border-2 border-ink bg-sheet" aria-hidden="true" />
+            Gone quiet
           </span>
         )}
         <span className="inline-flex items-center gap-2">

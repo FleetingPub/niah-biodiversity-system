@@ -67,7 +67,14 @@ export default async function OverviewPage() {
     supabase.from("species_staff").select("id", { count: "exact", head: true }),
     // Only these columns, because this page has no use for the readings
     supabase.from("iot_node_status").select("node_id, quiet, last_reading_at"),
-    supabase.from("iot_alerts").select(ALERT_COLUMNS).eq("status", "open"),
+    // The alerts the badge in the staff menu counts: going on, nobody has picked them up, and not
+    // from an edge's backlog (iot_check_alerts in 017). The sensors page has the rest.
+    supabase
+      .from("iot_alerts")
+      .select(ALERT_COLUMNS)
+      .eq("status", "open")
+      .is("cleared_at", null)
+      .eq("from_backlog", false),
   ]);
   if (recordsResult.error) {
     console.error("Loading the records for the overview failed:", recordsResult.error.message);
@@ -233,11 +240,13 @@ export default async function OverviewPage() {
                   >
                     {ALERT_LEVEL[alert.severity].label}
                   </span>
-                  {ALERT_WORDS[alert.kind].title}
+                  {ALERT_WORDS[alert.type].title}
                 </p>
                 <p className="text-sm text-moss">
-                  {alert.nodeId}, {alert.nodeName}. Last seen{" "}
-                  {formatDateTime(parkTime(alert.lastSeenAt))}.
+                  {alert.nodeId}, {alert.nodeName}.{" "}
+                  {/* A quiet alert starts at the node's last reading, before the silence */}
+                  {alert.type === "QUIET" ? "Last reading" : "Started"}{" "}
+                  {formatDateTime(parkTime(alert.recordedAt))}.
                 </p>
               </div>
               <Link

@@ -5,13 +5,16 @@
 // signing out (Auth), reading and changing rows (the REST API), and uploading, deleting and
 // showing photos (Storage). Every request runs as the anon or authenticated role with the user's
 // ID in the JWT claims, like the real API, so Row Level Security, the grants and the views from
-// our SQL files decide what comes back.
+// our SQL files decide what comes back. It also runs our edge-com function (edge-com.js), so an
+// edge device on this computer can upload to it, and starts with a day of made-up sensor readings
+// so the Sensors page and its map have something to show.
 //
 // Everything is in memory, so stopping it throws it all away. Never put real data in it.
 // web/README.md says how to run the website against it.
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
+import { EDGE_COM_RUNS, startEdgeCom } from './edge-com.js';
 import { asUser, newDatabase, SQL_FILES } from './harness.js';
 
 /** The anon key the website uses with the stand-in. It only works here. */
@@ -20,8 +23,9 @@ export const ANON_KEY = 'stand-in-anon-key';
 export const SERVICE_KEY = 'stand-in-service-key';
 
 /**
- * A made up edge device with the three sample nodes on it, so iot/node-simulator works with no
- * setup. The token only works here. A real one comes from the Devices page.
+ * A made up edge device with the sample nodes from 002 on it, so an edge on this computer can
+ * upload to /functions/v1/edge-com with no setup: edge_id NNP-EDGE-01 and this token as edge_key in
+ * its secrets.toml. The token only works here. A real one comes from the Devices page.
  */
 export const TEST_DEVICE_ID = 'NNP-EDGE-01';
 export const TEST_DEVICE_TOKEN = 'stand-in-device-token';
@@ -146,11 +150,25 @@ export async function startStandIn({
   log = console.log,
   // The last SQL file to run, like '015', to try the website before the newer files are on hosted
   sqlThrough = null,
+  // A day of made-up readings and alerts from the sample nodes. The tests turn it off to start empty
+  sensorData = true,
 } = {}) {
   const sqlFiles = sqlThrough ? SQL_FILES.filter((file) => file.slice(0, 3) <= sqlThrough) : SQL_FILES;
   const db = await newDatabase(sqlFiles);
   await addTestData(db);
-  if (sqlFiles.includes('016_iot_readings.sql')) await addTestDevice(db);
+  // edge-com needs every sensor file, 016_1 to 025. Without them it isn't there, like a project
+  // where it hasn't been deployed.
+  const sensors = IOT_FILES.every((file) => sqlFiles.includes(file));
+  let edgeCom = null;
+  if (sensors) {
+    await addTestDevice(db);
+    if (EDGE_COM_RUNS) {
+      edgeCom = await startEdgeCom(db, { output: { log, warn: log, error: log } });
+      if (sensorData) await addSensorData(db, edgeCom);
+    } else {
+      log('edge-com needs Node 22.13 or newer, so the stand-in runs without it and its sensor data');
+    }
+  }
 
   // The API's schema cache: the columns of every table and view in public
   const columns = new Map();
@@ -188,7 +206,8 @@ export async function startStandIn({
   const linkSecret = randomBytes(32);
 
   const server = createServer((req, res) => {
-    handle(req, res, { auth, columns, db, files, functions, linkSecret, maxRows, oneAtATime })
+    const ctx = { auth, columns, db, edgeCom, files, functions, linkSecret, maxRows, oneAtATime };
+    handle(req, res, ctx)
       .catch((error) => {
         console.error(error);
         if (!res.headersSent) send(res, 500, { message: 'The stand-in broke. See its terminal.' });
@@ -203,6 +222,8 @@ export async function startStandIn({
   return {
     url: `http://${host}:${server.address().port}`,
     db,
+    // Whether edge-com is running, which it is when every sensor file is
+    edgeCom: edgeCom !== null,
     // Every email Auth would have sent, oldest first, so tests can follow the links
     emails: auth.emails,
     async close() {
@@ -210,22 +231,134 @@ export async function startStandIn({
         server.close(resolve);
         server.closeAllConnections();
       });
+      await edgeCom?.close();
       await db.close();
     },
   };
 }
 
+// The sensor files, 016_1 to 025
+const IOT_FILES = SQL_FILES.filter((file) => file.includes('_iot_'));
+
 async function addTestDevice(db) {
-  await db.query('INSERT INTO public.iot_devices (device_id, name, zone) VALUES ($1, $2, $3)', [
-    TEST_DEVICE_ID,
-    'Stand-in edge device',
-    'Made up region',
-  ]);
+  await db.query(
+    `INSERT INTO public.iot_devices (device_id, name, zone, latitude, longitude)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [TEST_DEVICE_ID, 'Stand-in edge device', 'Made up region', 3.8143, 113.7795],
+  );
   await db.query('INSERT INTO public.iot_device_tokens (device_id, token_hash) VALUES ($1, $2)', [
     TEST_DEVICE_ID,
     createHash('sha256').update(TEST_DEVICE_TOKEN).digest(),
   ]);
   await db.query('UPDATE public.iot_nodes SET edge_device_id = $1', [TEST_DEVICE_ID]);
+}
+
+// The made-up sensor data: a reading every 10 minutes for the last day from the first three sample
+// nodes, each placed a little way from park HQ like every other sample point. They go in through
+// edge-com, so the alerts come from the same rules as on Supabase:
+//   the first node's soil has been waterlogged for the last 20 minutes (an urgent alert going on),
+//   the second also raises RAIN, and has light rain now (a routine one going on) and was moved for
+//     10 minutes before that (an alert that ended by itself and nobody has resolved),
+//   the third stopped sending 3 hours ago (QUIET).
+// The numbers follow a day in the forest but aren't from a real node.
+const SAMPLE_PLACES = [
+  { lat: 3.8157, lng: 113.7786, soil: 2650, distance: 120 },
+  { lat: 3.8136, lng: 113.7811, soil: 2900, distance: 95 },
+  { lat: 3.8125, lng: 113.778, soil: 2500, distance: 140 },
+];
+const TEN_MINUTES = 600;
+
+// The same wobble every run, so the sample looks the same each time
+function wobble(seed) {
+  const x = Math.sin(seed * 12.9898) * 43758.5453;
+  return x - Math.floor(x) - 0.5;
+}
+
+async function addSensorData(db, edgeCom) {
+  const { rows: nodes } = await db.query(
+    'SELECT node_id FROM public.iot_nodes ORDER BY node_id LIMIT $1',
+    [SAMPLE_PLACES.length],
+  );
+  if (nodes[1]) {
+    await db.query(
+      `UPDATE public.iot_nodes SET alert_types = array_append(alert_types, 'RAIN') WHERE node_id = $1`,
+      [nodes[1].node_id],
+    );
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const batch = { edge_id: TEST_DEVICE_ID, nodes: [], boots: [] };
+  nodes.forEach(({ node_id: node }, n) => {
+    const place = SAMPLE_PLACES[n];
+    const bootId = 1_000_000_000 + n * 7919;
+    // From a day ago to 10 minutes ago, then one a minute ago. The third node stops 3 hours ago
+    const times = [];
+    for (let at = now - 24 * 3600; at <= now - TEN_MINUTES; at += TEN_MINUTES) times.push(at);
+    times.push(now - 60);
+    const sent = n === 2 ? times.filter((at) => at <= now - 3 * 3600) : times;
+    const rows = sent.map((at, i) => {
+      const ago = (now - at) / 60;
+      const seed = n * 1000 + i;
+      // Malaysian time of day, coolest before dawn and warmest mid afternoon
+      const hour = (((at / 3600 + 8) % 24) + 24) % 24;
+      const warmth = Math.sin(((hour - 9) / 24) * 2 * Math.PI);
+      // An afternoon shower on the first and third nodes, which don't raise RAIN
+      const shower = n !== 1 && hour >= 15 && hour < 16.5;
+      let soil = place.soil + Math.round(wobble(seed) * 40) - (shower ? 220 : 0);
+      let rain = shower ? 2900 + Math.round(wobble(seed + 1) * 120) : 4095;
+      let distance = place.distance + Math.round(wobble(seed + 2) * 8) / 10;
+      if (n === 0 && ago <= 20) soil = 1670 + Math.round(wobble(seed) * 20);
+      if (n === 1 && ago <= 50 && ago > 35) distance = place.distance + 15;
+      if (n === 1 && ago <= 20) rain = 3316 + Math.round(wobble(seed + 1) * 30);
+      return [
+        i + 1, // seq
+        at, // when it was measured
+        1, // lag: the edge got it a second later
+        Math.round((26.5 + 3.5 * warmth + wobble(seed + 3)) * 10) / 10, // temp_c
+        Math.round(86 - 9 * warmth + wobble(seed + 4) * 4), // hum_pct
+        soil,
+        rain,
+        distance,
+        place.distance, // baseline_cm
+        0, // beep_on
+        -64 + Math.round(wobble(seed + 5) * 12), // rssi
+        0, // motion
+      ];
+    });
+    batch.nodes.push({ node_id: node, boot_id: bootId, rows });
+    batch.boots.push({
+      node_id: node,
+      boot_id: bootId,
+      lat: place.lat,
+      lon: place.lng,
+      at: new Date(sent[0] * 1000).toISOString(),
+    });
+  });
+  const response = await edgeCom.upload(TEST_DEVICE_TOKEN, batch);
+  if (!response.ok) throw new Error(`The sample readings didn't go in: ${await response.text()}`);
+
+  // The first node was found with its locate beep two hours ago, by the test officer
+  if (!nodes[0]) return;
+  const officer = TEST_USERS.find((user) => user.role === 'conservation_officer');
+  for (const [command, minutesAgo] of [
+    ['beep_on', 125],
+    ['beep_off', 110],
+  ]) {
+    const { rows } = await asUser(db, officer, (tx) =>
+      tx.query('INSERT INTO public.iot_commands (node_id, command) VALUES ($1, $2) RETURNING id', [
+        nodes[0].node_id,
+        command,
+      ]),
+    );
+    await db.query(
+      `UPDATE public.iot_commands
+       SET status = 'done', result = 'ok', created_at = now() - make_interval(mins => $2),
+         at_edge_at = now() - make_interval(mins => $2) + interval '20 seconds',
+         sent_at = now() - make_interval(mins => $2) + interval '21 seconds',
+         done_at = now() - make_interval(mins => $2) + interval '23 seconds'
+       WHERE id = $1`,
+      [rows[0].id, minutesAgo],
+    );
+  }
 }
 
 async function addTestData(db) {
@@ -270,6 +403,10 @@ async function handle(req, res, ctx) {
   if (req.method === 'OPTIONS') return send(res, 204);
 
   const url = new URL(req.url, 'http://stand-in');
+  // Supabase Edge Functions. edge-com has JWT verification turned off, so an edge only sends its
+  // own token, without the anon key
+  if (url.pathname.startsWith('/functions/v1/')) return edgeFunction(req, res, url, ctx);
+
   // Public and signed photo links work without the anon key, because an <img> can't send one
   const link = /^\/storage\/v1\/object\/(public|sign)\//.exec(url.pathname);
   if (link && (link[1] === 'public' || req.method === 'GET' || req.method === 'HEAD')) {
@@ -352,6 +489,45 @@ function send(res, status, body, headers = {}) {
 function bearerOf(req) {
   const match = /^Bearer (.+)$/i.exec(req.headers.authorization ?? '');
   return match ? match[1] : null;
+}
+
+// ----- Edge Functions -----
+
+// Supabase takes a request body of up to 20 MB. edge-com has its own, smaller, limit after it
+// unzips one.
+const FUNCTION_BODY_LIMIT = 20 * 1024 * 1024;
+// Headers that are about this connection, not the request, so they don't go on to edge-com
+const HOP_HEADERS = new Set(['connection', 'content-length', 'host', 'keep-alive', 'transfer-encoding']);
+
+/** /functions/v1/edge-com, handed to our edge-com function the way Supabase does. */
+async function edgeFunction(req, res, url, { edgeCom, oneAtATime }) {
+  const chunks = [];
+  let size = 0;
+  // Reads to the end even when it's too big, so the answer still gets back on the same connection
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size <= FUNCTION_BODY_LIMIT) chunks.push(chunk);
+  }
+  if (url.pathname !== '/functions/v1/edge-com' || !edgeCom) {
+    return send(res, 404, { code: 'NOT_FOUND', message: 'Requested function was not found' });
+  }
+  if (size > FUNCTION_BODY_LIMIT) return send(res, 413, { message: 'The body is over 20 MB' });
+
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value !== undefined && !HOP_HEADERS.has(name)) headers.set(name, [value].flat().join(', '));
+  }
+  const reading = req.method === 'GET' || req.method === 'HEAD';
+  const request = new Request(`http://stand-in${req.url}`, {
+    method: req.method,
+    headers,
+    body: reading ? undefined : Buffer.concat(chunks),
+  });
+  // PGlite has one connection, so edge-com takes its turn with the API's requests
+  const response = await oneAtATime(() => edgeCom.handle(request));
+  const body = Buffer.from(await response.arrayBuffer());
+  res.writeHead(response.status, Object.fromEntries(response.headers));
+  return res.end(body);
 }
 
 // ----- Auth -----
@@ -1298,7 +1474,8 @@ async function signLinks(res, { bucket }, body, asker, ctx) {
 
 // `npm run stand-in` runs this. STAND_IN_PORT changes the port, STAND_IN_TOKEN_SECONDS makes a
 // sign in run out sooner, to try refreshing, STAND_IN_MAX_ROWS sends fewer rows per read, to try
-// reading a long list in pages, and STAND_IN_SQL_THROUGH=015 leaves out the SQL files after 015.
+// reading a long list in pages, STAND_IN_SQL_THROUGH=015 leaves out the SQL files after 015, and
+// STAND_IN_SENSOR_DATA=0 starts with no sensor readings.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const port = Number(process.env.STAND_IN_PORT || 54321);
   const tokenSeconds = Number(process.env.STAND_IN_TOKEN_SECONDS || 3600);
@@ -1312,9 +1489,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exit(1);
   }
   const sqlThrough = process.env.STAND_IN_SQL_THROUGH || null;
-  const standIn = await startStandIn({ port, tokenSeconds, maxRows, sqlThrough });
+  const sensorData = process.env.STAND_IN_SENSOR_DATA !== '0';
+  const standIn = await startStandIn({ port, tokenSeconds, maxRows, sqlThrough, sensorData });
   console.log(`Supabase stand-in running on ${standIn.url}, with the anon key ${ANON_KEY}`);
   console.log('Test accounts (the password is TEST_PASSWORD in stand-in.js):');
   for (const user of TEST_USERS) console.log(`  ${user.email}  ${user.role ?? 'no profile'}`);
+  if (standIn.edgeCom) {
+    console.log(`An edge on this computer uploads to ${standIn.url}/functions/v1/edge-com`);
+    console.log(`  as ${TEST_DEVICE_ID}, with TEST_DEVICE_TOKEN in stand-in.js as its edge_key`);
+  }
   console.log('Press Ctrl+C to stop it. Everything in it goes when it stops.');
 }

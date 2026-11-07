@@ -5,8 +5,9 @@ import { Icon } from "@/components/icon";
 import { useVisibleTimer } from "@/lib/use-visible-timer";
 import { refreshSensors } from "./actions";
 
-// Edge devices send every 10 seconds, so a threat shows up here within about 25 seconds. The
-// proposal's goal is 30.
+// A node sends straight away when something starts, and its edge device sends that on at once
+// (a quick alert), so a threat shows up here within about 20 seconds. The proposal's goal is 30.
+// Routine readings reach the database once a minute.
 const REFRESH_MS = 15000;
 
 /**

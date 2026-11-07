@@ -15,9 +15,12 @@ export type AlertItem = {
   title: string;
   means: string;
   todo: string;
-  reading: string | null;
-  /** "Started 2 Oct, 2:14 am, last seen 5 minutes ago, 12 times" */
+  /** Extra lines, like "Readings back to normal at 2:40 am" or a note that it came in late */
+  details: string[];
+  /** "Started 2 Oct, 2:14 am (40 minutes ago)" */
   seen: string;
+  /** It came from an edge device's backlog after an outage, so it may be long over */
+  late: boolean;
   /** "Acknowledged by Aina Officer, 2 Oct, 2:20 am" */
   handled: string | null;
 };
@@ -63,12 +66,21 @@ function AlertRow({
           </span>
           <span className="font-mono font-bold text-ink">{alert.nodeId}</span>
           <span className="text-moss">{alert.nodeName}</span>
+          {alert.late && (
+            <span className="rounded-full border border-line bg-paper px-2 py-px text-xs font-bold text-moss">
+              Came in late
+            </span>
+          )}
         </p>
         <h3 id={`alert-${alert.id}`} tabIndex={-1} className="mt-2 font-bold">
           {alert.title}
         </h3>
         <p className="mt-1 max-w-2xl text-sm">{alert.means}</p>
-        {alert.reading && <p className="mt-1 text-sm font-bold">{alert.reading}</p>}
+        {alert.details.map((line) => (
+          <p key={line} className="mt-1 text-sm font-bold">
+            {line}
+          </p>
+        ))}
         <p className="mt-2 max-w-2xl text-sm">
           <span className="font-bold">What to do: </span>
           {alert.todo}
@@ -115,7 +127,18 @@ function AlertRow({
   );
 }
 
-export function AlertList({ alerts }: { alerts: AlertItem[] }) {
+export function AlertList({
+  alerts,
+  clearId,
+  clearTitle,
+  clearText,
+}: {
+  alerts: AlertItem[];
+  /** Where focus goes when the last alert in this list is resolved */
+  clearId: string;
+  clearTitle: string;
+  clearText: string;
+}) {
   const [announcement, setAnnouncement] = useState("");
   // The new list can arrive from the server just after the button's answer, so this keeps trying on
   // each draw until the place to move focus to is on the page.
@@ -152,7 +175,7 @@ export function AlertList({ alerts }: { alerts: AlertItem[] }) {
     const left = alerts.filter((other) => other.id !== alert.id);
     const index = alerts.findIndex((other) => other.id === alert.id);
     const next = left[Math.min(index, left.length - 1)];
-    wantFocus.current = next ? `alert-${next.id}` : "alerts-clear";
+    wantFocus.current = next ? `alert-${next.id}` : clearId;
   }
 
   return (
@@ -166,10 +189,10 @@ export function AlertList({ alerts }: { alerts: AlertItem[] }) {
             <Icon name="check" />
           </span>
           <div>
-            <h3 id="alerts-clear" tabIndex={-1} className="font-bold">
-              No open alerts
+            <h3 id={clearId} tabIndex={-1} className="font-bold">
+              {clearTitle}
             </h3>
-            <p className="text-sm text-moss">New ones show up here and in the staff menu.</p>
+            <p className="text-sm text-moss">{clearText}</p>
           </div>
         </div>
       ) : (

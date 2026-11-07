@@ -1,50 +1,63 @@
-// Checks 016_iot_readings.sql and 017_iot_alerts.sql: device tokens, adding readings, who can read
-// what, the threat rules, one alert for one problem, acknowledging and resolving, nodes going
-// quiet, and that nothing from a node reaches the public. The last parts do the same through the
-// stand-in, the way an edge device and the website do it, and then with the node simulator.
+// Checks the sensor files, 016_1 to 017 and 023 to 025, and our edge-com function, which is the
+// only way readings get in: device tokens, what edge-com stores and leaves out, the alert rules
+// with each node's own settings, nodes going quiet, acknowledging and resolving, commands for the
+// nodes, calibration, who can read and change what, and that nothing from a node reaches the
+// public. edge-com runs here in Node on the same database (edge-com.js). The last parts do it all
+// through the stand-in, the way an edge device and the website do it. iot-limit.test.js checks 022.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { after, before, describe, test } from 'node:test';
+import { gzipSync } from 'node:zlib';
+import { after, before, beforeEach, describe, test } from 'node:test';
+import { EDGE_COM_RUNS, startEdgeCom } from './edge-com.js';
 import { addUser, asUser, insertAs, newDatabase, readSql, selectAs, SQL_FILES } from './harness.js';
-import { ANON_KEY, startStandIn, TEST_PASSWORD, TEST_USERS } from './stand-in.js';
+import { ANON_KEY, startStandIn, TEST_DEVICE_ID, TEST_PASSWORD, TEST_USERS } from './stand-in.js';
+
+/** The sensor files, in the order they run. */
+const IOT_FILES = SQL_FILES.filter((file) => file.includes('_iot_'));
 
 let db;
+let edge;
 let botanist;
 let researcher;
 let visitor;
 let officer;
 let admin;
-let tokenA;
-let tokenB;
+let keyA;
+let keyB;
 let nodeCount = 0;
-let readingCount = 0;
-
-/** A reading from a node where nothing is wrong. */
-const calm = {
-  temperature_c: 25,
-  humidity_percent: 70,
-  soil_moisture_percent: 50,
-  rain_percent: 0,
-  battery_percent: 90,
-  tilt_degrees: 1,
-  shock_g: 1,
-  distance_change_cm: 0,
-  motion_detected: false,
-};
 
 const notAllowed = { code: '42501', message: /permission denied/ };
 const notTheirRole = { code: '42501', message: /row-level security/ };
-const noReadings = { code: '42501', message: /can't add readings/ };
+// What edge-com says to a wrong token, an unknown device and a device that's turned off
+const notThisDevice = { status: 401, body: { error: "this device can't send readings" } };
+
+// A reading where nothing is wrong: 55 % soil, no rain, the ground where it was
+const CALM = {
+  temp_c: 26,
+  hum_pct: 80,
+  soil_raw: 2600,
+  rain_raw: 4095,
+  dist_cm: 120,
+  baseline_cm: 120,
+  beep_on: 0,
+  rssi: -60,
+  motion: 0,
+};
+// The order of the values in a row, after seq, ts and lag (ROW_FIELDS in edge-com and cloud-com.py)
+const VALUES = Object.keys(CALM);
 
 function who(user) {
   return user ? user.role : 'anon';
 }
 
-function minutesAgo(minutes) {
-  return new Date(Date.now() - minutes * 60_000).toISOString();
-}
+const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+// Each test's "now", in whole seconds, so a test that crosses into the next second still agrees
+// with itself about when "60 seconds ago" was
+let testNow;
+beforeEach(() => {
+  testNow = nowSeconds();
+});
 
 /** Calls a function as a user, the way the API does an RPC. It gives back the one value. */
 async function call(user, sql, params = []) {
@@ -56,62 +69,102 @@ function makeToken(user, device) {
   return call(user, 'public.iot_make_device_token($1)', [device]);
 }
 
-/** What an edge device sends. Anyone can call it, because it goes by the token. */
-function send(device, token, readings) {
-  return call(null, 'public.iot_add_readings($1, $2, $3::jsonb)', [
-    device,
-    token,
-    JSON.stringify(readings),
-  ]);
+/** Sends a batch to edge-com the way an edge does, and gives back the status and the answer. */
+async function upload(key, batch, options) {
+  const response = await edge.upload(key, batch, options);
+  const text = await response.text();
+  return { status: response.status, body: text ? JSON.parse(text) : null };
 }
 
-/** A reading with an ID of its own, sent from the node given. */
-function reading(node, changes = {}) {
-  readingCount += 1;
-  return {
-    reading_id: `test-${readingCount}`,
-    node_id: node,
-    recorded_at: new Date().toISOString(),
-    ...calm,
-    ...changes,
-  };
+// The next seq for each node and power-up, from 1 like the sketch
+const seqs = new Map();
+
+/**
+ * Readings from one node in one upload. Each one is { ago, ...changes }: how many seconds ago it
+ * was measured and what's different from CALM. seq carries on from the node's last reading.
+ */
+function send(node, readings, { device = 'REGION-A', key = keyA, boot = 1, lag = 1, batch = {} } = {}) {
+  const now = testNow;
+  const rows = readings.map(({ ago = 0, ...changes }) => {
+    const id = `${node}/${boot}`;
+    const seq = (seqs.get(id) ?? 0) + 1;
+    seqs.set(id, seq);
+    const values = { ...CALM, ...changes };
+    return [seq, now - ago, lag, ...VALUES.map((name) => values[name])];
+  });
+  // The edge says which calibration it has. A big number means it has them all, so the answer
+  // only has something in it when the test is about that
+  return upload(key, {
+    edge_id: device,
+    nodes: [{ node_id: node, boot_id: boot, rows }],
+    cal_since: Number.MAX_SAFE_INTEGER,
+    ...batch,
+  });
 }
 
-function sendFrom(node, changes = {}, device = 'REGION-A', token = tokenA) {
-  return send(device, token, [reading(node, changes)]);
-}
-
-/** A new node on the device given, so each test has its own readings and alerts. */
-async function newNode(device = 'REGION-A') {
+/** A new node on the device given, with its own settings, so each test has its own alerts. */
+async function newNode({ device = 'REGION-A', settings = {} } = {}) {
   nodeCount += 1;
-  const id = `TEST-NODE-${nodeCount}`;
+  // An underscore, like the sketch's default NNP_NODE_01, is fine in a node ID
+  const id = `TEST_NODE-${nodeCount}`;
   await db.query(
     'INSERT INTO public.iot_nodes (node_id, name, zone, edge_device_id) VALUES ($1, $2, $3, $4)',
     [id, `Test node ${nodeCount}`, 'Test zone', device],
   );
+  const columns = Object.keys(settings);
+  if (columns.length) {
+    // All in one change, because some settings have to agree with each other
+    const set = columns.map((column, i) => `"${column}" = $${i + 2}`).join(', ');
+    await db.query(`UPDATE public.iot_nodes SET ${set} WHERE node_id = $1`, [id, ...Object.values(settings)]);
+  }
   return id;
 }
 
 /** Reads straight from the table as the postgres user, so no rules get in the way. */
 async function storedReadings(node) {
   const { rows } = await db.query(
-    'SELECT * FROM public.iot_readings WHERE node_id = $1 ORDER BY id',
+    'SELECT * FROM public.iot_readings WHERE node_id = $1 ORDER BY recorded_at, seq',
     [node],
   );
   return rows;
 }
 
-async function alertsFor(node, kind) {
+async function alertsFor(node, type) {
   const { rows } = await db.query(
-    `SELECT * FROM public.iot_alerts WHERE node_id = $1 AND ($2::text IS NULL OR kind = $2)
+    `SELECT * FROM public.iot_alerts WHERE node_id = $1 AND ($2::text IS NULL OR type = $2)
      ORDER BY id`,
-    [node, kind ?? null],
+    [node, type ?? null],
   );
   return rows;
 }
 
+async function nodeRow(node) {
+  const { rows } = await db.query('SELECT * FROM public.iot_nodes WHERE node_id = $1', [node]);
+  return rows[0];
+}
+
+async function statusOf(node) {
+  return (await nodeRow(node)).status;
+}
+
+/** The lowest raw value that a node with the default calibration reads as pct percent. */
+async function rawFor(pct, { dry = 4095, wet = 1400 } = {}) {
+  const { rows } = await db.query(
+    `SELECT min(raw) AS raw FROM generate_series(0, 4095) AS raw
+     WHERE public.iot_raw_pct(raw, $2, $3) = $1`,
+    [pct, dry, wet],
+  );
+  assert.notEqual(rows[0].raw, null, `no raw value reads as ${pct} %`);
+  return rows[0].raw;
+}
+
+const soilAt = (pct) => rawFor(pct);
+const rainAt = (pct) => rawFor(pct, { dry: 4095, wet: 1500 });
+
 before(async () => {
+  assert.ok(EDGE_COM_RUNS, 'These tests run edge-com, which needs Node 22.13 or newer');
   db = await newDatabase();
+  edge = await startEdgeCom(db, { output: { log() {}, warn() {}, error: console.error } });
   botanist = await addUser(db, { role: 'botanist', name: 'Field botanist' });
   researcher = await addUser(db, { role: 'researcher', name: 'Researcher' });
   visitor = await addUser(db, { name: 'Visitor' });
@@ -120,11 +173,12 @@ before(async () => {
 
   await insertAs(db, admin, 'public.iot_devices', { device_id: 'REGION-A', name: 'Region A' });
   await insertAs(db, admin, 'public.iot_devices', { device_id: 'REGION-B', name: 'Region B' });
-  tokenA = (await makeToken(admin, 'REGION-A')).token;
-  tokenB = (await makeToken(admin, 'REGION-B')).token;
+  keyA = (await makeToken(admin, 'REGION-A')).token;
+  keyB = (await makeToken(admin, 'REGION-B')).token;
 });
 
 after(async () => {
+  await edge.close();
   await db.close();
 });
 
@@ -154,7 +208,7 @@ describe('device tokens', () => {
       'HASH-TEST',
     ]);
     assert.ok(!JSON.stringify(device).includes(made.token));
-    await assert.rejects(call(admin, 'public.iot_make_device_token($1)', ['NO-SUCH-DEVICE']), /no device/);
+    await assert.rejects(makeToken(admin, 'NO-SUCH-DEVICE'), /no device/);
   });
 
   test('two tokens are never the same', async () => {
@@ -166,11 +220,11 @@ describe('device tokens', () => {
   test('a new token stops the old one straight away', async () => {
     await insertAs(db, admin, 'public.iot_devices', { device_id: 'ROTATE', name: 'Rotate test' });
     const old = await makeToken(admin, 'ROTATE');
-    assert.equal((await send('ROTATE', old.token, [])).accepted, 0);
+    assert.equal((await upload(old.token, { edge_id: 'ROTATE' })).status, 204);
 
     const replaced = await makeToken(admin, 'ROTATE');
-    await assert.rejects(send('ROTATE', old.token, []), noReadings);
-    assert.equal((await send('ROTATE', replaced.token, [])).accepted, 0);
+    assert.deepEqual(await upload(old.token, { edge_id: 'ROTATE' }), notThisDevice);
+    assert.equal((await upload(replaced.token, { edge_id: 'ROTATE' })).status, 204);
   });
 
   test('the device says who made the token and when, and nobody can write that themselves', async () => {
@@ -185,8 +239,10 @@ describe('device tokens', () => {
     assert.equal(device.token_made_by_name, 'Park admin');
     assert.ok(device.token_made_at >= new Date(startedAt.getTime() - 1000));
 
-    const forged = "UPDATE public.iot_devices SET token_made_by_name = 'Someone else' WHERE device_id = $1";
-    await assert.rejects(selectAs(db, admin, forged, ['ROTATE']), notAllowed);
+    for (const column of ['token_made_by_name', 'token_made_at', 'last_heard_at', 'created_at']) {
+      const forged = `UPDATE public.iot_devices SET ${column} = NULL WHERE device_id = $1`;
+      await assert.rejects(selectAs(db, admin, forged, ['ROTATE']), notAllowed, column);
+    }
   });
 
   test('nobody reads or writes the hashes through the API, admins included', async () => {
@@ -212,824 +268,591 @@ describe('device tokens', () => {
   });
 });
 
-describe('adding readings', () => {
-  test('the right token adds a reading, and the server fills in the device and the arrival time', async () => {
-    const node = await newNode();
-    const startedAt = new Date();
-    const sent = reading(node);
-    assert.deepEqual(await send('REGION-A', tokenA, [sent]), {
-      accepted: 1,
-      duplicates: 0,
-      refused: [],
-    });
-
-    const [stored] = await storedReadings(node);
-    assert.equal(stored.device_id, 'REGION-A');
-    assert.equal(stored.reading_id, sent.reading_id);
-    assert.equal(Number(stored.temperature_c), 25);
-    assert.equal(stored.motion_detected, false);
-    assert.ok(stored.received_at >= new Date(startedAt.getTime() - 1000));
-  });
-
-  test('a reading can only give values, not choose its own device or arrival time', async () => {
-    const node = await newNode();
-    const lateAt = '2020-01-01T00:00:00Z';
-    await sendFrom(node, { device_id: 'REGION-B', received_at: lateAt, id: 999999 });
-    const [stored] = await storedReadings(node);
-    assert.equal(stored.device_id, 'REGION-A');
-    assert.notEqual(stored.received_at.getFullYear(), 2020);
-    assert.notEqual(Number(stored.id), 999999);
-  });
-
+describe('who edge-com takes uploads from', () => {
   test('a wrong token, an unknown device and a device turned off all get the same answer', async () => {
     await insertAs(db, admin, 'public.iot_devices', { device_id: 'TURNED-OFF', name: 'Off' });
     await insertAs(db, admin, 'public.iot_devices', { device_id: 'NO-TOKEN', name: 'No token' });
-    const offToken = (await makeToken(admin, 'TURNED-OFF')).token;
+    const offKey = (await makeToken(admin, 'TURNED-OFF')).token;
     await selectAs(db, admin, 'UPDATE public.iot_devices SET enabled = false WHERE device_id = $1', [
       'TURNED-OFF',
     ]);
 
-    const tries = [
-      ['REGION-A', 'wrong'],
-      ['REGION-A', tokenB],
-      ['NO-SUCH-DEVICE', tokenA],
-      ['NO-TOKEN', tokenA],
-      ['TURNED-OFF', offToken],
-      ['REGION-A', null],
-      [null, tokenA],
-      ['REGION-A', 'x'.repeat(201)],
-    ];
-    const answers = new Set();
-    for (const [device, token] of tries) {
-      await assert.rejects(send(device, token, []), (error) => {
-        answers.add(`${error.code} ${error.message}`);
-        return true;
-      });
+    for (const [device, key] of [
+      ['REGION-A', 'wrong-but-long-enough'],
+      ['REGION-A', keyB],
+      ['NO-SUCH-DEVICE', keyA],
+      ['NO-TOKEN', keyA],
+      ['TURNED-OFF', offKey],
+    ]) {
+      assert.deepEqual(await upload(key, { edge_id: device }), notThisDevice, `${device}`);
     }
-    assert.equal(answers.size, 1);
-    assert.match([...answers][0], /^42501 /);
+    // A key or device ID that can't be one is turned down before the database is asked
+    for (const [device, key] of [
+      ['REGION-A', ''],
+      ['REGION-A', 'short'],
+      ['REGION-A', 'x'.repeat(201)],
+      [null, keyA],
+      ['has space', keyA],
+    ]) {
+      assert.equal((await upload(key, { edge_id: device })).status, 401, `${device} ${key}`);
+    }
 
     // Turning it back on lets it send again, with the same token
     await selectAs(db, admin, 'UPDATE public.iot_devices SET enabled = true WHERE device_id = $1', [
       'TURNED-OFF',
     ]);
-    assert.equal((await send('TURNED-OFF', offToken, [])).accepted, 0);
+    assert.equal((await upload(offKey, { edge_id: 'TURNED-OFF' })).status, 204);
   });
 
-  test("a device can't add readings for another device's node, or find out which nodes exist", async () => {
-    const theirs = await newNode('REGION-B');
-    const unlinked = await newNode(null);
-    const refused = await send('REGION-A', tokenA, [
-      reading(theirs),
-      reading(unlinked),
-      reading('NO-SUCH-NODE'),
-      reading(null),
-    ]);
-    assert.equal(refused.accepted, 0);
-    assert.deepEqual(
-      refused.refused.map((row) => row.why),
-      Array(4).fill('node_not_on_this_device'),
-    );
-    assert.deepEqual(await storedReadings(theirs), []);
-    assert.deepEqual(await storedReadings(unlinked), []);
-  });
+  test('only a POST of JSON, plain or gzipped, of a size it takes', async () => {
+    const asked = (init) => edge.handle(new Request('http://edge-com.test/', init));
+    assert.equal((await asked({ method: 'GET' })).status, 405);
+    const notJson = await asked({ method: 'POST', body: '{nope', headers: { 'x-edge-key': keyA } });
+    assert.equal(notJson.status, 400);
+    const list = await asked({ method: 'POST', body: '[]', headers: { 'x-edge-key': keyA } });
+    assert.equal(list.status, 400);
+    const plain = await upload(keyA, { edge_id: 'REGION-A' }, { gzip: false });
+    assert.equal(plain.status, 204);
 
-  test('two devices can use the same reading ID', async () => {
-    const mine = await newNode('REGION-A');
-    const theirs = await newNode('REGION-B');
-    const id = { reading_id: 'same-id-on-both' };
-    assert.equal((await sendFrom(mine, id)).accepted, 1);
-    assert.equal((await sendFrom(theirs, id, 'REGION-B', tokenB)).accepted, 1);
-    assert.equal((await storedReadings(mine)).length, 1);
-    assert.equal((await storedReadings(theirs)).length, 1);
-  });
-
-  const ranges = [
-    ['temperature_c', -20, 70, -21, 71],
-    ['humidity_percent', 0, 100, -1, 101],
-    ['soil_moisture_percent', 0, 100, -1, 101],
-    ['rain_percent', 0, 100, -1, 101],
-    ['battery_percent', 0, 100, -1, 101],
-    ['tilt_degrees', 0, 180, -1, 181],
-    ['shock_g', 0, 32, -1, 33],
-    ['distance_change_cm', 0, 500, -1, 501],
-  ];
-
-  for (const [field, lowest, highest, tooLow, tooHigh] of ranges) {
-    test(`${field} has to be from ${lowest} to ${highest}`, async () => {
-      const node = await newNode();
-      for (const value of [lowest, highest]) {
-        assert.equal((await sendFrom(node, { [field]: value })).accepted, 1, `${value}`);
-      }
-      for (const value of [tooLow, tooHigh, 'NaN']) {
-        const answer = await sendFrom(node, { [field]: value });
-        assert.equal(answer.accepted, 0, `${value}`);
-        assert.equal(answer.refused[0].why, `${field}_in_range`, `${value}`);
-      }
-      for (const value of ['hot', true, {}, 'Infinity', 99999999]) {
-        const answer = await sendFrom(node, { [field]: value });
-        assert.equal(answer.accepted, 0, `${value}`);
-        assert.equal(answer.refused[0].why, 'bad_value', `${value}`);
-      }
-      assert.equal((await storedReadings(node)).length, 2);
-    });
-  }
-
-  test('latitude and longitude have to be real and come together', async () => {
     const node = await newNode();
-    const refusedFor = async (changes) => (await sendFrom(node, changes)).refused[0]?.why;
-    assert.equal(await refusedFor({ latitude: 91, longitude: 0 }), 'latitude_in_range');
-    assert.equal(await refusedFor({ latitude: 0, longitude: 181 }), 'longitude_in_range');
-    assert.equal(await refusedFor({ latitude: 1 }), 'latitude_and_longitude_together');
-    assert.equal(await refusedFor({ longitude: 1 }), 'latitude_and_longitude_together');
-    assert.equal(await refusedFor({ latitude: 1, longitude: 1 }), undefined);
-  });
-
-  test('a reading with only some sensors is fine', async () => {
-    const node = await newNode();
-    const answer = await send('REGION-A', tokenA, [
-      { reading_id: readingCount + '-only-soil', node_id: node, soil_moisture_percent: 40 },
-    ]);
-    assert.equal(answer.accepted, 1);
-    const [stored] = await storedReadings(node);
-    assert.equal(Number(stored.soil_moisture_percent), 40);
-    assert.equal(stored.temperature_c, null);
-    assert.equal(stored.motion_detected, null);
-  });
-
-  test('a batch can hold 100 readings but not 101', async () => {
-    const node = await newNode();
-    const many = Array.from({ length: 101 }, () => reading(node));
-    await assert.rejects(send('REGION-A', tokenA, many), /At most 100/);
+    const rows = Array.from({ length: 1001 }, (_, i) => [i + 1, nowSeconds(), 1, ...VALUES.map((v) => CALM[v])]);
+    const tooMany = await upload(keyA, { edge_id: 'REGION-A', nodes: [{ node_id: node, boot_id: 1, rows }] });
+    assert.equal(tooMany.status, 413);
     assert.deepEqual(await storedReadings(node), []);
-    assert.equal((await send('REGION-A', tokenA, many.slice(0, 100))).accepted, 100);
+    // Over 4 MB once it's unzipped
+    const huge = gzipSync(JSON.stringify({ edge_id: 'REGION-A', padding: 'x'.repeat(5_000_000) }));
+    const big = await asked({ method: 'POST', body: huge, headers: { 'x-edge-key': keyA } });
+    assert.equal(big.status, 413);
   });
 
-  test('readings has to be a list', async () => {
-    for (const notList of [{ reading_id: 'x' }, 'x', 5, null]) {
-      await assert.rejects(send('REGION-A', tokenA, notList), /has to be a list/);
-    }
+  test('an upload says the device is alive, even an empty one', async () => {
+    const startedAt = new Date();
+    assert.equal((await upload(keyB, { edge_id: 'REGION-B' })).status, 204);
+    const [device] = await selectAs(
+      db,
+      officer,
+      'SELECT last_heard_at FROM public.iot_devices WHERE device_id = $1',
+      ['REGION-B'],
+    );
+    assert.ok(device.last_heard_at >= new Date(startedAt.getTime() - 1000));
+  });
+});
+
+describe('the readings edge-com stores', () => {
+  test('it stores the raw values, the device, the power-up and both times', async () => {
     const node = await newNode();
-    const answer = await send('REGION-A', tokenA, [5, 'x', [], reading(node)]);
-    assert.equal(answer.accepted, 1);
+    const measured = nowSeconds() - 30;
+    const sent = [1, measured, 4, 25.5, 71, 2222, 3999, 118.4, 120, 1, -67, 1];
+    const answer = await upload(keyA, {
+      edge_id: 'REGION-A',
+      nodes: [{ node_id: node, boot_id: 2840193877, rows: [sent] }],
+      cal_since: Number.MAX_SAFE_INTEGER,
+    });
+    assert.equal(answer.status, 204);
+
+    const [stored] = await storedReadings(node);
+    assert.equal(stored.device_id, 'REGION-A');
+    assert.equal(Number(stored.boot_id), 2840193877);
+    assert.equal(Number(stored.seq), 1);
+    assert.equal(stored.recorded_at.getTime(), measured * 1000);
+    // The node measured it, and the edge got it 4 seconds later
+    assert.equal(stored.ts_source, 'device');
+    assert.equal(stored.received_at.getTime(), (measured + 4) * 1000);
     assert.deepEqual(
-      answer.refused.map((row) => row.why),
-      ['not_a_reading', 'not_a_reading', 'not_a_reading'],
+      VALUES.map((name) => stored[name]),
+      [25.5, 71, 2222, 3999, 118.4, 120, true, -67, true],
     );
   });
 
-  test('times have to make sense, and a missing time means now', async () => {
+  test('with no lag, the time is the edge’s, because the node had no clock yet', async () => {
     const node = await newNode();
-    const refusedFor = async (when) => (await sendFrom(node, { recorded_at: when })).refused[0]?.why;
-    assert.equal(await refusedFor(minutesAgo(-6)), 'recorded_at_ahead');
-    assert.equal(await refusedFor(minutesAgo(8 * 24 * 60)), 'recorded_at_too_old');
-    assert.equal(await refusedFor('not a date'), 'bad_value');
-    assert.equal(await refusedFor(minutesAgo(-4)), undefined);
-    assert.equal(await refusedFor(minutesAgo(6 * 24 * 60)), undefined);
-
-    const startedAt = new Date();
-    const untimed = await newNode();
-    await sendFrom(untimed, { recorded_at: undefined });
-    const [stored] = await storedReadings(untimed);
-    assert.ok(stored.recorded_at >= new Date(startedAt.getTime() - 1000));
+    await send(node, [{ ago: 5 }], { lag: null });
+    const [stored] = await storedReadings(node);
+    assert.equal(stored.ts_source, 'edge');
+    assert.equal(stored.received_at.getTime(), stored.recorded_at.getTime());
   });
 
-  test('a reading ID has to be short and plain', async () => {
+  test('a value no part could measure is left out, and the rest of the reading is kept', async () => {
     const node = await newNode();
-    for (const id of ['', 'has space', "it's", 'x'.repeat(65)]) {
-      const answer = await sendFrom(node, { reading_id: id });
-      assert.equal(answer.refused[0].why, 'reading_id_format', id);
+    const tooFar = {
+      temp_c: 51,
+      hum_pct: -1,
+      soil_raw: 4096,
+      rain_raw: 1.5,
+      dist_cm: 1001,
+      baseline_cm: 'far',
+      beep_on: 2,
+      rssi: 1,
+      motion: true,
+    };
+    for (const [name, value] of Object.entries(tooFar)) {
+      await send(node, [{ ago: 10, [name]: value }]);
     }
-    const answer = await sendFrom(node, { reading_id: undefined });
-    assert.equal(answer.refused[0].why, 'reading_id_format');
+    const stored = await storedReadings(node);
+    assert.equal(stored.length, VALUES.length);
+    stored.forEach((reading, i) => {
+      const leftOut = VALUES[i];
+      assert.equal(reading[leftOut], null, leftOut);
+      // Another value from the same reading is still there
+      const other = VALUES[(i + 1) % VALUES.length];
+      assert.notEqual(reading[other], null, `${leftOut} took ${other} with it`);
+    });
+
+    // The edges of each range are fine
+    const edges = { temp_c: 50, hum_pct: 0, soil_raw: 0, rain_raw: 4095, dist_cm: 0, rssi: -127 };
+    await send(node, [{ ago: 5, ...edges }]);
+    const last = (await storedReadings(node)).at(-1);
+    for (const [name, value] of Object.entries(edges)) assert.equal(last[name], value, name);
   });
 
-  test('one bad reading is turned down alone and the answer says which and why', async () => {
+  test('the database checks the ranges too, and says which value was wrong', async () => {
     const node = await newNode();
-    const good = reading(node);
-    const bad = reading(node, { humidity_percent: 300 });
-    const alsoGood = reading(node);
-    assert.deepEqual(await send('REGION-A', tokenA, [good, bad, alsoGood]), {
-      accepted: 2,
-      duplicates: 0,
-      refused: [{ index: 1, reading_id: bad.reading_id, why: 'humidity_percent_in_range' }],
+    const insert = (column, value) =>
+      db.query(
+        `INSERT INTO public.iot_readings (device_id, node_id, boot_id, seq, recorded_at, ts_source,
+           received_at, "${column}")
+         VALUES ('REGION-A', $1, 1, 999, now(), 'device', now(), $2)`,
+        [node, value],
+      );
+    for (const [column, value] of [
+      ['temp_c', 50.5],
+      ['hum_pct', 101],
+      ['soil_raw', 5000],
+      ['rain_raw', -1],
+      ['dist_cm', 1001],
+      ['baseline_cm', -1],
+      ['rssi', 1],
+    ]) {
+      await assert.rejects(insert(column, value), new RegExp(`${column}_in_range`), column);
+    }
+    await assert.rejects(
+      db.query(
+        `INSERT INTO public.iot_readings (device_id, node_id, boot_id, seq, recorded_at, ts_source,
+           received_at) VALUES ('REGION-A', $1, 1, 1, now(), 'gps', now())`,
+        [node],
+      ),
+      /ts_source_kind/,
+    );
+  });
+
+  test('a reading measured more than 5 minutes ahead is skipped, and old ones are kept', async () => {
+    const node = await newNode();
+    await send(node, [{ ago: -6 * 60 }, { ago: -4 * 60 }, { ago: 2 * 24 * 3600 }]);
+    const stored = await storedReadings(node);
+    assert.deepEqual(
+      stored.map((reading) => Math.round((reading.recorded_at.getTime() / 1000 - testNow) / 60)),
+      [-2 * 24 * 60, 4],
+    );
+  });
+
+  test('a reading that is not a row of 12 values is skipped on its own', async () => {
+    const node = await newNode();
+    const good = [1, nowSeconds(), 1, ...VALUES.map((v) => CALM[v])];
+    const answer = await upload(keyA, {
+      edge_id: 'REGION-A',
+      nodes: [
+        {
+          node_id: node,
+          boot_id: 3,
+          rows: [good, [2, nowSeconds()], 'x', [null, nowSeconds(), 1, ...VALUES.map(() => null)], [3, 'now', 1, ...VALUES.map(() => null)]],
+        },
+      ],
+      cal_since: Number.MAX_SAFE_INTEGER,
     });
+    assert.equal(answer.status, 204);
+    assert.equal((await storedReadings(node)).length, 1);
+  });
+
+  test('sending a reading again stores it once, and a new power-up starts again from 1', async () => {
+    const node = await newNode();
+    const row = [1, nowSeconds() - 20, 1, ...VALUES.map((v) => CALM[v])];
+    const batch = (boot) => ({
+      edge_id: 'REGION-A',
+      nodes: [{ node_id: node, boot_id: boot, rows: [row] }],
+      cal_since: Number.MAX_SAFE_INTEGER,
+    });
+    await upload(keyA, batch(10));
+    await upload(keyA, batch(10));
+    assert.equal((await storedReadings(node)).length, 1);
+    await upload(keyA, batch(11));
     assert.equal((await storedReadings(node)).length, 2);
   });
 
-  test('sending a reading again keeps the first one and adds nothing', async () => {
-    const node = await newNode();
-    const sent = reading(node, { temperature_c: 20 });
-    assert.equal((await send('REGION-A', tokenA, [sent])).accepted, 1);
-    assert.deepEqual(await send('REGION-A', tokenA, [sent]), {
-      accepted: 0,
-      duplicates: 1,
-      refused: [],
+  test("a device can't add readings or positions for another device's node, or an unlinked one", async () => {
+    const theirs = await newNode({ device: 'REGION-B' });
+    const unlinked = await newNode({ device: null });
+    const mine = await newNode();
+    const row = [1, nowSeconds(), 1, ...VALUES.map((v) => CALM[v])];
+    const answer = await upload(keyA, {
+      edge_id: 'REGION-A',
+      nodes: [theirs, unlinked, 'NO-SUCH-NODE', mine].map((node) => ({ node_id: node, boot_id: 1, rows: [row] })),
+      boots: [theirs, mine].map((node) => ({
+        node_id: node,
+        boot_id: 1,
+        lat: 3.81,
+        lon: 113.78,
+        at: new Date().toISOString(),
+      })),
+      cal_since: Number.MAX_SAFE_INTEGER,
     });
-
-    const changed = { ...sent, temperature_c: 30 };
-    assert.equal((await send('REGION-A', tokenA, [changed])).duplicates, 1);
-    const stored = await storedReadings(node);
-    assert.equal(stored.length, 1);
-    assert.equal(Number(stored[0].temperature_c), 20);
+    // The rest of the batch still goes in, so one wrongly linked node doesn't hold up the others
+    assert.equal(answer.status, 204);
+    assert.deepEqual(await storedReadings(theirs), []);
+    assert.deepEqual(await storedReadings(unlinked), []);
+    assert.equal((await storedReadings(mine)).length, 1);
+    const { rows } = await db.query('SELECT node_id FROM public.iot_boots WHERE node_id = ANY($1)', [
+      [theirs, mine],
+    ]);
+    assert.deepEqual(rows, [{ node_id: mine }]);
   });
 
-  test('the answer only has counts, never anything stored', async () => {
+  test('the node keeps what its newest reading said, and an older batch does not change it', async () => {
     const node = await newNode();
-    const answer = await sendFrom(node, { latitude: 1, longitude: 1 });
-    assert.deepEqual(Object.keys(answer).sort(), ['accepted', 'duplicates', 'refused']);
+    await send(node, [{ ago: 60, rssi: -70, beep_on: 1, baseline_cm: 118 }]);
+    let row = await nodeRow(node);
+    assert.deepEqual([row.last_rssi, row.beep_on, row.baseline_cm], [-70, true, 118]);
+    const heartbeat = row.last_heartbeat.getTime();
+    assert.equal(heartbeat, (testNow - 60) * 1000, 'last_heartbeat is the reading’s time');
+
+    // Readings from the edge's buffer, measured before the one above
+    await send(node, [{ ago: 300, rssi: -90, beep_on: 0, baseline_cm: 200 }]);
+    row = await nodeRow(node);
+    assert.deepEqual([row.last_rssi, row.beep_on, row.baseline_cm], [-70, true, 118]);
+    assert.equal(row.last_heartbeat.getTime(), heartbeat);
   });
 
-  test('an empty batch says the device is alive and adds nothing', async () => {
-    await db.query("UPDATE public.iot_devices SET last_heard_at = NULL WHERE device_id = 'REGION-B'");
-    assert.deepEqual(await send('REGION-B', tokenB, []), { accepted: 0, duplicates: 0, refused: [] });
-    const { rows } = await db.query(
-      "SELECT last_heard_at FROM public.iot_devices WHERE device_id = 'REGION-B'",
-    );
-    assert.ok(rows[0].last_heard_at);
-  });
-
-  test('being signed in does not help: only the publishable key can call it', async () => {
-    for (const user of [visitor, researcher, botanist, officer, admin]) {
-      await assert.rejects(
-        call(user, 'public.iot_add_readings($1, $2, $3::jsonb)', ['REGION-A', tokenA, '[]']),
-        notAllowed,
-        who(user),
-      );
-    }
-  });
-
-  test('every function has its search path locked and only the grants it needs', async () => {
-    const { rows } = await db.query(`
-      SELECT p.proname AS name, p.prosecdef AS definer, p.proconfig AS config,
-        has_function_privilege('anon', p.oid, 'EXECUTE') AS anon,
-        has_function_privilege('authenticated', p.oid, 'EXECUTE') AS authenticated,
-        has_function_privilege('service_role', p.oid, 'EXECUTE') AS service,
-        ARRAY(SELECT 1 FROM unnest(p.proacl) AS acl WHERE acl::text LIKE '=%') AS public_grant
-      FROM pg_proc AS p
-      WHERE p.pronamespace = 'public'::regnamespace
-        AND (p.proname LIKE 'iot\\_%')
-      ORDER BY 1`);
-    const called = {
-      iot_acknowledge_alert: 'authenticated',
-      iot_add_readings: 'anon',
-      iot_check_alerts: 'authenticated',
-      iot_check_reading: null,
-      iot_device_heard: null,
-      iot_limit_readings: null,
-      iot_make_device_token: 'authenticated',
-      iot_raise_alert: null,
-      iot_raise_quiet_alerts: null,
-      iot_resolve_alert: 'authenticated',
-    };
+  test('each power-up keeps its position and the first and last reading that arrived', async () => {
+    const node = await newNode();
+    const at = new Date().toISOString();
+    await send(node, [{ ago: 50 }, { ago: 40 }], {
+      boot: 77,
+      batch: { boots: [{ node_id: node, boot_id: 77, lat: 3.8151, lon: 113.7792, at }] },
+    });
+    // seq 3 went missing, then 4 and 5 came
+    seqs.set(`${node}/77`, 3);
+    await send(node, [{ ago: 20 }, { ago: 10 }], { boot: 77 });
+    const { rows } = await db.query('SELECT * FROM public.iot_boots WHERE node_id = $1', [node]);
+    assert.equal(rows.length, 1);
+    const [boot] = rows;
     assert.deepEqual(
-      rows.map((row) => row.name),
-      Object.keys(called),
+      [boot.device_id, boot.latitude, boot.longitude, Number(boot.first_seq), Number(boot.last_seq)],
+      ['REGION-A', 3.8151, 113.7792, 1, 5],
     );
-    for (const row of rows) {
-      assert.equal(row.definer, true, row.name);
-      assert.deepEqual(row.config, ['search_path=""'], row.name);
-      assert.equal(row.anon, called[row.name] === 'anon', `${row.name} anon`);
-      assert.equal(row.authenticated, called[row.name] === 'authenticated', `${row.name} signed in`);
-      assert.equal(row.service, false, `${row.name} service role`);
-      assert.deepEqual(row.public_grant, [], row.name);
-    }
+    assert.equal(boot.position_at.toISOString(), at);
+    assert.equal(boot.first_recorded_at.getTime(), (testNow - 50) * 1000);
+
+    // A position needs both halves, or it's kept as no position
+    await upload(keyA, {
+      edge_id: 'REGION-A',
+      boots: [{ node_id: node, boot_id: 78, lat: 3.8, at }],
+    });
+    const { rows: half } = await db.query(
+      'SELECT latitude, longitude FROM public.iot_boots WHERE node_id = $1 AND boot_id = 78',
+      [node],
+    );
+    assert.deepEqual(half, [{ latitude: null, longitude: null }]);
   });
 });
 
-describe('who reads and changes what', () => {
-  let node;
-
-  before(async () => {
-    node = await newNode();
-    await sendFrom(node, { tilt_degrees: 90 });
+describe('working out percent from the raw values', () => {
+  test('iot_raw_pct maps dry to 0 and wet to 100, whole numbers, kept within 0 to 100', async () => {
+    const pct = (raw, dry, wet) => call(officer, 'public.iot_raw_pct($1, $2, $3)', [raw, dry, wet]);
+    assert.equal(await pct(4095, 4095, 1400), 0);
+    assert.equal(await pct(1400, 4095, 1400), 100);
+    assert.equal(await pct(2600, 4095, 1400), 55);
+    // Cut down to a whole number like the ESP32 and the edge do, not rounded
+    assert.equal(await pct(1670, 4095, 1400), 89);
+    assert.equal(await pct(4095 + 0, 4000, 1400), 0);
+    assert.equal(await pct(1000, 4095, 1400), 100);
+    // A sensor wired the other way round
+    assert.equal(await pct(3000, 1000, 3000), 100);
+    assert.equal(await pct(null, 4095, 1400), null);
+    assert.equal(await pct(2000, 1400, 1400), null);
   });
 
-  test('only officers and admins read readings and alerts', async () => {
-    for (const table of ['iot_readings', 'iot_alerts']) {
-      const sql = `SELECT id FROM public.${table} WHERE node_id = $1`;
-      for (const user of [officer, admin]) {
-        assert.equal((await selectAs(db, user, sql, [node])).length, 1, `${table} ${who(user)}`);
-      }
-      for (const user of [visitor, researcher, botanist]) {
-        assert.deepEqual(await selectAs(db, user, sql, [node]), [], `${table} ${who(user)}`);
-      }
-      await assert.rejects(selectAs(db, null, sql, [node]), notAllowed, table);
-    }
-  });
-
-  test('nobody adds, changes or removes a reading or an alert directly, admins included', async () => {
-    const writes = [
-      `INSERT INTO public.iot_readings (device_id, node_id, reading_id, recorded_at)
-       VALUES ('REGION-A', '${node}', 'by-hand', now())`,
-      `UPDATE public.iot_readings SET temperature_c = 1 WHERE node_id = '${node}'`,
-      `DELETE FROM public.iot_readings WHERE node_id = '${node}'`,
-      `INSERT INTO public.iot_alerts (node_id, node_name, kind, severity, first_seen_at, last_seen_at)
-       VALUES ('${node}', 'x', 'quiet', 'urgent', now(), now())`,
-      `UPDATE public.iot_alerts SET status = 'resolved', resolved_at = now() WHERE node_id = '${node}'`,
-      `DELETE FROM public.iot_alerts WHERE node_id = '${node}'`,
-    ];
-    for (const sql of writes) {
-      for (const user of [null, visitor, researcher, botanist, officer, admin]) {
-        await assert.rejects(selectAs(db, user, sql), notAllowed, `${who(user)}: ${sql}`);
-      }
-    }
-    assert.equal((await storedReadings(node)).length, 1);
-    assert.equal((await alertsFor(node)).length, 1);
-  });
-
-  test('only admins see and manage devices', async () => {
-    const list = 'SELECT device_id FROM public.iot_devices WHERE device_id = $1';
-    const rename = "UPDATE public.iot_devices SET name = 'Changed' WHERE device_id = $1 RETURNING device_id";
-    const remove = 'DELETE FROM public.iot_devices WHERE device_id = $1 RETURNING device_id';
-    const device = { device_id: 'NOT-ALLOWED', name: 'Not allowed' };
-    assert.deepEqual(await selectAs(db, admin, list, ['REGION-A']), [{ device_id: 'REGION-A' }]);
-
-    for (const user of [visitor, researcher, botanist, officer]) {
-      assert.deepEqual(await selectAs(db, user, list, ['REGION-A']), [], who(user));
-      assert.deepEqual(await selectAs(db, user, rename, ['REGION-A']), [], who(user));
-      assert.deepEqual(await selectAs(db, user, remove, ['REGION-A']), [], who(user));
-      await assert.rejects(insertAs(db, user, 'public.iot_devices', device), notTheirRole, who(user));
-    }
-    await assert.rejects(selectAs(db, null, list, ['REGION-A']), notAllowed);
-    await assert.rejects(insertAs(db, null, 'public.iot_devices', device), notAllowed);
-  });
-
-  test('admins only set the name, the zone and whether a device is on', async () => {
-    const forge = [
-      "UPDATE public.iot_devices SET last_heard_at = now() WHERE device_id = 'REGION-A'",
-      "UPDATE public.iot_devices SET token_made_at = now() WHERE device_id = 'REGION-A'",
-      "UPDATE public.iot_devices SET device_id = 'RENAMED' WHERE device_id = 'REGION-A'",
-    ];
-    for (const sql of forge) {
-      await assert.rejects(selectAs(db, admin, sql), notAllowed, sql);
-    }
-    await assert.rejects(
-      insertAs(db, admin, 'public.iot_devices', {
-        device_id: 'FORGED',
-        name: 'Forged',
-        token_made_at: new Date().toISOString(),
-      }),
-      notAllowed,
-    );
-    await assert.rejects(
-      insertAs(db, admin, 'public.iot_devices', { device_id: 'has space', name: 'Bad ID' }),
-      { code: '23514' },
-    );
-  });
-
-  test('only admins link a node to a device', async () => {
-    const link = "UPDATE public.iot_nodes SET edge_device_id = 'REGION-B' WHERE node_id = $1 RETURNING node_id";
-    const free = await newNode();
-    for (const user of [visitor, researcher, botanist, officer]) {
-      assert.deepEqual(await selectAs(db, user, link, [free]), [], who(user));
-    }
-    await assert.rejects(selectAs(db, null, link, [free]), notAllowed);
-    assert.deepEqual(await selectAs(db, admin, link, [free]), [{ node_id: free }]);
-  });
-
-  test("a device or node with history can't be removed, and one without can", async () => {
-    await assert.rejects(
-      selectAs(db, admin, 'DELETE FROM public.iot_nodes WHERE node_id = $1', [node]),
-      { code: '23503' },
-    );
-    await assert.rejects(
-      selectAs(db, admin, "DELETE FROM public.iot_devices WHERE device_id = 'REGION-A'"),
-      { code: '23503' },
-    );
-
-    await insertAs(db, admin, 'public.iot_devices', { device_id: 'EMPTY', name: 'No history' });
-    await makeToken(admin, 'EMPTY');
-    const unused = await newNode('EMPTY');
-    await selectAs(db, admin, "DELETE FROM public.iot_devices WHERE device_id = 'EMPTY'");
-    // Removing a device takes its token with it and leaves its node unlinked
-    const { rows: tokens } = await db.query(
-      "SELECT device_id FROM public.iot_device_tokens WHERE device_id = 'EMPTY'",
-    );
-    assert.deepEqual(tokens, []);
-    const { rows: nodes } = await db.query(
-      'SELECT edge_device_id FROM public.iot_nodes WHERE node_id = $1',
-      [unused],
-    );
-    assert.deepEqual(nodes, [{ edge_device_id: null }]);
-    await selectAs(db, admin, 'DELETE FROM public.iot_nodes WHERE node_id = $1', [unused]);
-  });
-
-  test('every IoT table has Row Level Security on', async () => {
-    const { rows } = await db.query(`
-      SELECT c.relname, c.relrowsecurity
-      FROM pg_class AS c
-      WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND c.relname LIKE 'iot\\_%'
-      ORDER BY 1`);
-    assert.deepEqual(rows, [
-      'iot_alert_limits',
-      'iot_alerts',
-      'iot_device_tokens',
-      'iot_devices',
-      'iot_nodes',
-      'iot_readings',
-    ].map((relname) => ({ relname, relrowsecurity: true })));
+  test('a new calibration changes what the old readings read as', async () => {
+    const node = await newNode();
+    await send(node, [{ ago: 30, soil_raw: 2600 }]);
+    const soil = async () =>
+      (await selectAs(db, officer, 'SELECT soil_pct FROM public.iot_node_status WHERE node_id = $1', [node]))[0]
+        .soil_pct;
+    assert.equal(await soil(), 55);
+    await selectAs(db, admin, 'UPDATE public.iot_nodes SET soil_wet_raw = 2000 WHERE node_id = $1', [node]);
+    assert.equal(await soil(), 71);
   });
 });
 
-describe('threat rules', () => {
-  const rules = [
-    ['tilt_degrees', 31, 30, 'disturbance', 'urgent'],
-    ['shock_g', 3, 2.5, 'disturbance', 'urgent'],
-    ['distance_change_cm', 11, 10, 'disturbance', 'urgent'],
-    ['soil_moisture_percent', 19, 20, 'soil_dry', 'routine'],
-    ['soil_moisture_percent', 86, 85, 'soil_wet', 'routine'],
-    ['temperature_c', 41, 40, 'too_hot', 'routine'],
-    ['temperature_c', 14, 15, 'too_cold', 'routine'],
-    ['battery_percent', 19, 20, 'battery_low', 'routine'],
+describe('the alert rules', () => {
+  const RULES = [
+    // type, severity, what raises it, the closest that doesn't, the node's settings
+    ['SATURATED', 'urgent', async () => ({ soil_raw: await soilAt(85) }), async () => ({ soil_raw: await soilAt(84) })],
+    ['HEAVY', 'urgent', async () => ({ rain_raw: await rainAt(60) }), async () => ({ rain_raw: await rainAt(59) })],
+    ['TOO_HOT', 'urgent', async () => ({ temp_c: 45 }), async () => ({ temp_c: 44.9 })],
+    ['MOVED', 'urgent', async () => ({ dist_cm: 130.1 }), async () => ({ dist_cm: 130 })],
+    ['NO_ECHO', 'urgent', async () => ({ dist_cm: null }), async () => ({ dist_cm: 0.5, baseline_cm: 0 })],
+    ['MOTION', 'urgent', async () => ({ motion: 1 }), async () => ({ motion: 0 })],
+    ['DRY', 'routine', async () => ({ soil_raw: await soilAt(20) }), async () => ({ soil_raw: await soilAt(21) }), true],
+    ['RAIN', 'routine', async () => ({ rain_raw: await rainAt(20) }), async () => ({ rain_raw: await rainAt(19) }), true],
   ];
 
-  for (const [field, value, limit, kind, severity] of rules) {
-    test(`${field} at ${value} raises a ${severity} ${kind} alert, and at ${limit} it doesn't`, async () => {
-      const node = await newNode();
-      await sendFrom(node, { [field]: limit });
+  for (const [type, severity, raises, doesNot, needsTurningOn] of RULES) {
+    test(`${type} raises ${severity === 'urgent' ? 'an' : 'a'} ${severity} alert, and just short of it nothing`, async () => {
+      const settings = needsTurningOn
+        ? { alert_types: ['SATURATED', 'DRY', 'HEAVY', 'RAIN', 'MOVED', 'NO_ECHO', 'MOTION', 'TOO_HOT', 'QUIET'] }
+        : {};
+      const node = await newNode({ settings });
+      await send(node, [{ ago: 120, ...(await doesNot()) }]);
       assert.deepEqual(await alertsFor(node), []);
+      assert.equal(await statusOf(node), 'online');
 
-      const seenAt = minutesAgo(1);
-      await sendFrom(node, { [field]: value, recorded_at: seenAt });
-      const [alert] = await alertsFor(node);
-      assert.equal(alert.kind, kind);
-      assert.equal(alert.severity, severity);
-      assert.equal(alert.status, 'open');
-      assert.equal(alert.reading_field, field);
-      assert.equal(Number(alert.reading_value), value);
-      assert.equal(Number(alert.limit_value), limit);
-      assert.equal(alert.repeat_count, 1);
-      assert.equal(alert.first_seen_at.toISOString(), seenAt);
-      assert.equal(alert.node_name.startsWith('Test node'), true);
+      await send(node, [{ ago: 60, ...(await raises()) }]);
+      const alerts = await alertsFor(node);
+      assert.deepEqual(
+        alerts.map((a) => [a.type, a.severity, a.status, a.from_backlog]),
+        [[type, severity, 'open', false]],
+      );
+      assert.equal(alerts[0].node_name, (await nodeRow(node)).name);
+      assert.equal(alerts[0].device_id, 'REGION-A');
+      assert.equal(alerts[0].recorded_at.getTime(), (testNow - 60) * 1000);
+      assert.equal(await statusOf(node), severity === 'urgent' ? 'threat_triggered' : 'warning');
     });
   }
 
-  test('the PIR raises a routine alert, because animals set it off too', async () => {
+  test('DRY and RAIN only raise alerts on a node that has them turned on', async () => {
     const node = await newNode();
-    await sendFrom(node, { motion_detected: true });
-    const [alert] = await alertsFor(node);
-    assert.equal(alert.kind, 'movement');
-    assert.equal(alert.severity, 'routine');
-  });
-
-  test('a calm reading raises nothing, and neither does a sensor the node lacks', async () => {
-    const node = await newNode();
-    await sendFrom(node);
-    await send('REGION-A', tokenA, [{ reading_id: `empty-${node}`, node_id: node }]);
+    await send(node, [{ ago: 60, soil_raw: await soilAt(5), rain_raw: await rainAt(40) }]);
     assert.deepEqual(await alertsFor(node), []);
   });
 
-  test('a refused reading raises nothing', async () => {
-    const node = await newNode();
-    await sendFrom(node, { tilt_degrees: 999 });
+  test('a type turned off raises nothing, and a value the node lacks raises nothing', async () => {
+    const node = await newNode({ settings: { alert_types: ['SATURATED', 'QUIET'] } });
+    await send(node, [{ ago: 90, motion: 1, temp_c: 49, dist_cm: null }]);
+    await send(node, [{ ago: 60, soil_raw: null, baseline_cm: null }]);
     assert.deepEqual(await alertsFor(node), []);
   });
 
-  test('50 readings of one problem are one alert with a count of 50', async () => {
+  test('a calm reading raises nothing', async () => {
     const node = await newNode();
-    const readings = Array.from({ length: 50 }, () => reading(node, { tilt_degrees: 80 }));
-    await send('REGION-A', tokenA, readings);
-    const alerts = await alertsFor(node);
-    assert.equal(alerts.length, 1);
-    assert.equal(alerts[0].repeat_count, 50);
+    await send(node, [{ ago: 60 }]);
+    assert.deepEqual(await alertsFor(node), []);
   });
 
-  test('tilt, a knock and a change in distance on one node are all one disturbance', async () => {
+  test('one problem that carries on is one alert, however many readings show it', async () => {
     const node = await newNode();
-    await sendFrom(node, { tilt_degrees: 80, shock_g: 5, distance_change_cm: 50 });
+    const wet = await soilAt(95);
+    await send(node, Array.from({ length: 20 }, (_, i) => ({ ago: 400 - i * 10, soil_raw: wet })));
+    await send(node, [{ ago: 100, soil_raw: wet }]);
     const alerts = await alertsFor(node);
     assert.equal(alerts.length, 1);
-    assert.equal(alerts[0].repeat_count, 1);
-    assert.equal(alerts[0].reading_field, 'tilt_degrees');
+    assert.equal(alerts[0].recorded_at.getTime(), (testNow - 400) * 1000);
+  });
+
+  test('sending the same readings again does not count them twice', async () => {
+    const node = await newNode({ settings: { alert_confirm_readings: 2 } });
+    const row = [1, nowSeconds() - 60, 1, ...VALUES.map((v) => CALM[v])];
+    row[3] = 47; // temp_c
+    const batch = { edge_id: 'REGION-A', nodes: [{ node_id: node, boot_id: 1, rows: [row] }] };
+    await upload(keyA, batch);
+    await upload(keyA, batch);
+    assert.deepEqual(await alertsFor(node), []);
   });
 
   test('different problems and different nodes get their own alerts', async () => {
-    const one = await newNode();
-    const two = await newNode();
-    await sendFrom(one, { tilt_degrees: 80, soil_moisture_percent: 5 });
-    await sendFrom(two, { tilt_degrees: 80 });
+    const first = await newNode();
+    const second = await newNode();
+    await send(first, [{ ago: 60, motion: 1, temp_c: 46 }]);
+    await send(second, [{ ago: 60, motion: 1 }]);
+    assert.deepEqual((await alertsFor(first)).map((a) => a.type).sort(), ['MOTION', 'TOO_HOT']);
+    assert.deepEqual((await alertsFor(second)).map((a) => a.type), ['MOTION']);
+  });
+
+  test('an alert ends by itself only once a reading is back past the clear line', async () => {
+    const node = await newNode();
+    await send(node, [
+      { ago: 400, soil_raw: await soilAt(86) },
+      // Between the clear line (80) and the alert line (85): still going on
+      { ago: 340, soil_raw: await soilAt(82) },
+    ]);
+    let [alert] = await alertsFor(node);
+    assert.equal(alert.cleared_at, null);
+
+    await send(node, [{ ago: 280, soil_raw: await soilAt(79) }]);
+    [alert] = await alertsFor(node);
+    assert.equal(alert.cleared_recorded_at.getTime(), (testNow - 280) * 1000);
+    assert.notEqual(alert.cleared_at, null);
+    // It ended, but nobody has resolved it, so it waits for someone on the Sensors page
+    assert.equal(alert.status, 'open');
+    assert.equal(await statusOf(node), 'online');
+  });
+
+  test('after an end, the same problem stays quiet for alert_rearm_s, by the readings’ clock', async () => {
+    const node = await newNode();
+    const wet = await soilAt(90);
+    const dry = await soilAt(50);
+    await send(node, [
+      { ago: 1000, soil_raw: wet },
+      { ago: 900, soil_raw: dry },
+      // 100 seconds after it ended: under the default 300, so no new alert
+      { ago: 800, soil_raw: wet },
+      { ago: 750, soil_raw: dry },
+      // 400 seconds after: a new one
+      { ago: 500, soil_raw: wet },
+    ]);
+    const alerts = await alertsFor(node);
     assert.deepEqual(
-      (await alertsFor(one)).map((alert) => alert.kind).sort(),
-      ['disturbance', 'soil_dry'],
+      alerts.map((a) => (testNow * 1000 - a.recorded_at.getTime()) / 1000),
+      [1000, 500],
     );
-    assert.equal((await alertsFor(two)).length, 1);
   });
 
-  test('sending a reading again does not count it twice', async () => {
+  test('alert_confirm_readings in a row open one, from the first of them, and end one', async () => {
+    const node = await newNode({ settings: { alert_confirm_readings: 3 } });
+    await send(node, [
+      { ago: 600, temp_c: 46 },
+      { ago: 540, temp_c: 46 },
+      { ago: 480 },
+      { ago: 420, temp_c: 46 },
+      { ago: 360, temp_c: 46 },
+    ]);
+    assert.deepEqual(await alertsFor(node), []);
+    await send(node, [{ ago: 300, temp_c: 47 }]);
+    let [alert] = await alertsFor(node);
+    assert.equal(alert.recorded_at.getTime(), (testNow - 420) * 1000);
+    assert.equal(alert.confirmed_recorded_at.getTime(), (testNow - 300) * 1000);
+    assert.equal(Number(alert.seq), 4);
+
+    await send(node, [{ ago: 240 }, { ago: 180 }]);
+    assert.equal((await alertsFor(node))[0].cleared_at, null);
+    await send(node, [{ ago: 120 }]);
+    [alert] = await alertsFor(node);
+    assert.equal(alert.cleared_recorded_at.getTime(), (testNow - 240) * 1000);
+  });
+
+  test('MOTION ends after motion_clear_readings readings in a row without movement', async () => {
     const node = await newNode();
-    const sent = reading(node, { tilt_degrees: 80 });
-    await send('REGION-A', tokenA, [sent]);
-    await send('REGION-A', tokenA, [sent]);
+    await send(node, [{ ago: 300, motion: 1 }, { ago: 240 }, { ago: 180, motion: 1 }, { ago: 120 }]);
+    assert.equal((await alertsFor(node))[0].cleared_at, null);
+    await send(node, [{ ago: 60 }]);
     const [alert] = await alertsFor(node);
-    assert.equal(alert.repeat_count, 1);
+    assert.equal(alert.cleared_recorded_at.getTime(), (testNow - 120) * 1000);
+    // The second movement was during the same alert
+    assert.equal((await alertsFor(node)).length, 1);
   });
 
-  test('an old reading from a buffer widens the times but keeps the newest value', async () => {
+  test('a reading older than one already judged does not change an alert', async () => {
     const node = await newNode();
-    const newer = minutesAgo(1);
-    const older = minutesAgo(5);
-    await sendFrom(node, { tilt_degrees: 80, recorded_at: newer });
-    await sendFrom(node, { tilt_degrees: 40, recorded_at: older });
+    await send(node, [{ ago: 200, soil_raw: await soilAt(90) }]);
+    await send(node, [{ ago: 400 }]);
     const [alert] = await alertsFor(node);
-    assert.equal(alert.repeat_count, 2);
-    assert.equal(alert.first_seen_at.toISOString(), older);
-    assert.equal(alert.last_seen_at.toISOString(), newer);
-    assert.equal(Number(alert.reading_value), 80);
+    assert.equal(alert.cleared_at, null);
   });
 
-  test('a problem that carries on after it is resolved waits, then makes a new alert', async () => {
+  test('an alert that started over an hour before it came in is from the backlog', async () => {
     const node = await newNode();
-    await sendFrom(node, { soil_moisture_percent: 5 });
-    const [first] = await alertsFor(node);
-    await call(officer, 'public.iot_resolve_alert($1)', [first.id]);
-
-    // Still dry, straight after someone said it was dealt with
-    await sendFrom(node, { soil_moisture_percent: 5 });
-    assert.equal((await alertsFor(node)).length, 1);
-
-    // A reading from before they resolved it is not news
-    await db.query(
-      "UPDATE public.iot_alerts SET resolved_at = now() - INTERVAL '61 minutes' WHERE id = $1",
-      [first.id],
-    );
-    await sendFrom(node, { soil_moisture_percent: 5, recorded_at: minutesAgo(70) });
-    assert.equal((await alertsFor(node)).length, 1);
-
-    await sendFrom(node, { soil_moisture_percent: 5 });
-    const alerts = await alertsFor(node);
-    assert.equal(alerts.length, 2);
-    assert.equal(alerts[1].status, 'open');
-    assert.equal(alerts[1].repeat_count, 1);
+    await send(node, [{ ago: 2 * 3600, motion: 1 }, { ago: 2 * 3600 - 60 }, { ago: 2 * 3600 - 120 }]);
+    const [alert] = await alertsFor(node, 'MOTION');
+    // Kept with its real times, ended, and not something for anyone to rush to
+    assert.equal(alert.from_backlog, true);
+    assert.equal(alert.recorded_at.getTime(), (testNow - 2 * 3600) * 1000);
+    assert.notEqual(alert.cleared_at, null);
   });
 
-  test('a knock straight after a resolve makes a new alert, because someone could be back', async () => {
+  test('the database only lets one alert start at one reading', async () => {
     const node = await newNode();
-    await sendFrom(node, { tilt_degrees: 80 });
-    const [first] = await alertsFor(node);
-    await call(officer, 'public.iot_resolve_alert($1)', [first.id]);
-
-    // A reading from before they resolved it is not news, even for an urgent one
-    await sendFrom(node, { shock_g: 9, recorded_at: minutesAgo(5) });
-    assert.equal((await alertsFor(node)).length, 1);
-
-    await sendFrom(node, { shock_g: 9 });
-    const alerts = await alertsFor(node);
-    assert.equal(alerts.length, 2);
-    assert.equal(alerts[1].status, 'open');
-    assert.equal(alerts[1].severity, 'urgent');
-  });
-
-  test('a reading on an acknowledged alert counts on the same alert and stays acknowledged', async () => {
-    const node = await newNode();
-    await sendFrom(node, { tilt_degrees: 80 });
+    await send(node, [{ ago: 60, motion: 1 }]);
     const [alert] = await alertsFor(node);
-    await call(officer, 'public.iot_acknowledge_alert($1)', [alert.id]);
-    await sendFrom(node, { tilt_degrees: 80 });
-    const alerts = await alertsFor(node);
-    assert.equal(alerts.length, 1);
-    assert.equal(alerts[0].status, 'acknowledged');
-    assert.equal(alerts[0].repeat_count, 2);
-  });
-});
-
-describe('the limits the rules use', () => {
-  test('officers and admins read them, and everyone else gets nothing', async () => {
-    const sql = 'SELECT tilt_degrees_max FROM public.iot_alert_limits';
-    for (const user of [officer, admin]) {
-      assert.deepEqual(await selectAs(db, user, sql), [{ tilt_degrees_max: '30' }], who(user));
-    }
-    for (const user of [visitor, researcher, botanist]) {
-      assert.deepEqual(await selectAs(db, user, sql), [], who(user));
-    }
-    await assert.rejects(selectAs(db, null, sql), notAllowed);
-  });
-
-  test('only admins change them, and the rules follow straight away', async () => {
-    const change = 'UPDATE public.iot_alert_limits SET tilt_degrees_max = $1 RETURNING tilt_degrees_max';
-    for (const user of [visitor, researcher, botanist, officer]) {
-      assert.deepEqual(await selectAs(db, user, change, [5]), [], who(user));
-    }
-    await assert.rejects(selectAs(db, null, change, [5]), notAllowed);
-
-    const node = await newNode();
-    try {
-      await selectAs(db, admin, change, [50]);
-      await sendFrom(node, { tilt_degrees: 40 });
-      assert.deepEqual(await alertsFor(node), []);
-    } finally {
-      await selectAs(db, admin, change, [30]);
-    }
-  });
-
-  test('there is only ever one row, and nonsense limits are turned down', async () => {
-    await assert.rejects(
-      selectAs(db, admin, 'INSERT INTO public.iot_alert_limits (only_row) VALUES (true)'),
-      notAllowed,
-    );
-    await assert.rejects(selectAs(db, admin, 'DELETE FROM public.iot_alert_limits'), notAllowed);
-    await assert.rejects(
-      selectAs(db, admin, 'UPDATE public.iot_alert_limits SET soil_moisture_min = 90'),
-      { code: '23514' },
-    );
-    await assert.rejects(
-      selectAs(db, admin, 'UPDATE public.iot_alert_limits SET quiet_minutes = 0'),
-      { code: '23514' },
-    );
-  });
-});
-
-describe('acknowledging and resolving', () => {
-  async function openAlert() {
-    const node = await newNode();
-    await sendFrom(node, { tilt_degrees: 80 });
-    return (await alertsFor(node))[0];
-  }
-
-  async function stored(id) {
-    const { rows } = await db.query('SELECT * FROM public.iot_alerts WHERE id = $1', [id]);
-    return rows[0];
-  }
-
-  test('both say who and when, for officers and admins', async () => {
-    for (const user of [officer, admin]) {
-      const { id } = await openAlert();
-      const startedAt = new Date(Date.now() - 1000);
-
-      assert.deepEqual(await call(user, 'public.iot_acknowledge_alert($1)', [id]), {
-        id,
-        status: 'acknowledged',
-      });
-      const seen = await stored(id);
-      assert.equal(seen.status, 'acknowledged');
-      assert.equal(seen.acknowledged_by, user.id);
-      assert.equal(seen.acknowledged_by_name, user.name);
-      assert.ok(seen.acknowledged_at >= startedAt);
-      assert.equal(seen.resolved_at, null);
-
-      assert.deepEqual(await call(user, 'public.iot_resolve_alert($1)', [id]), {
-        id,
-        status: 'resolved',
-      });
-      const done = await stored(id);
-      assert.equal(done.status, 'resolved');
-      assert.equal(done.resolved_by, user.id);
-      assert.equal(done.resolved_by_name, user.name);
-      assert.ok(done.resolved_at >= startedAt);
-      assert.equal(done.closed_by_itself, false);
-    }
-  });
-
-  test('an alert can be resolved without being acknowledged first', async () => {
-    const { id } = await openAlert();
-    await call(officer, 'public.iot_resolve_alert($1)', [id]);
-    const done = await stored(id);
-    assert.equal(done.status, 'resolved');
-    assert.equal(done.acknowledged_at, null);
-  });
-
-  test('doing it twice keeps the first person', async () => {
-    const { id } = await openAlert();
-    await call(officer, 'public.iot_acknowledge_alert($1)', [id]);
-    const first = await stored(id);
-    await call(admin, 'public.iot_acknowledge_alert($1)', [id]);
-    const again = await stored(id);
-    assert.equal(again.acknowledged_by, officer.id);
-    assert.equal(again.acknowledged_at.getTime(), first.acknowledged_at.getTime());
-
-    await call(officer, 'public.iot_resolve_alert($1)', [id]);
-    await call(admin, 'public.iot_resolve_alert($1)', [id]);
-    assert.equal((await stored(id)).resolved_by, officer.id);
-
-    // Acknowledging something already resolved leaves it resolved
-    assert.equal((await call(admin, 'public.iot_acknowledge_alert($1)', [id])).status, 'resolved');
-    assert.equal((await stored(id)).status, 'resolved');
-  });
-
-  test('anyone else is turned down and the alert stays as it was', async () => {
-    const { id } = await openAlert();
-    for (const fn of ['iot_acknowledge_alert', 'iot_resolve_alert']) {
-      for (const user of [visitor, researcher, botanist]) {
-        await assert.rejects(call(user, `public.${fn}($1)`, [id]), { code: '42501' }, who(user));
-      }
-      await assert.rejects(call(null, `public.${fn}($1)`, [id]), notAllowed);
-    }
-    assert.equal((await stored(id)).status, 'open');
-  });
-
-  test('an alert that does not exist gets a clear answer', async () => {
-    await assert.rejects(call(officer, 'public.iot_acknowledge_alert($1)', [999999]), /no alert/);
-    await assert.rejects(call(officer, 'public.iot_resolve_alert($1)', [999999]), /no alert/);
-  });
-
-  test('the database only lets one unresolved alert exist for one problem', async () => {
-    const { node_id: node } = await openAlert();
     await assert.rejects(
       db.query(
-        `INSERT INTO public.iot_alerts (node_id, node_name, kind, severity, first_seen_at, last_seen_at)
-         VALUES ($1, 'x', 'disturbance', 'urgent', now(), now())`,
-        [node],
+        `INSERT INTO public.iot_alerts (node_id, node_name, device_id, type, severity, boot_id, seq,
+           recorded_at, confirmed_recorded_at)
+         SELECT node_id, node_name, device_id, type, severity, boot_id, seq, recorded_at, recorded_at
+         FROM public.iot_alerts WHERE id = $1`,
+        [alert.id],
       ),
-      { code: '23505' },
+      /iot_alerts_one_per_start/,
     );
   });
 });
 
 describe('nodes going quiet', () => {
-  const check = () => call(officer, 'public.iot_check_alerts()');
+  const minutes = (n) => n * 60;
+  const check = (user = officer) => call(user, 'public.iot_check_alerts()');
 
-  test('no reading for too long makes one urgent alert, however often it is checked', async () => {
+  test('no reading for longer than quiet_minutes makes one urgent alert, however often it is checked', async () => {
     const node = await newNode();
-    await sendFrom(node, { recorded_at: minutesAgo(20) });
+    await send(node, [{ ago: minutes(20) }]);
     await check();
     await check();
-    const alerts = await alertsFor(node, 'quiet');
+    const alerts = await alertsFor(node, 'QUIET');
     assert.equal(alerts.length, 1);
-    assert.equal(alerts[0].severity, 'urgent');
-    assert.equal(alerts[0].status, 'open');
-    assert.equal(alerts[0].repeat_count, 1);
-    assert.equal(Number(alerts[0].reading_value), 20);
-    assert.equal(Number(alerts[0].limit_value), 15);
+    assert.deepEqual([alerts[0].severity, alerts[0].boot_id, alerts[0].seq], ['urgent', null, null]);
+    assert.equal(alerts[0].recorded_at.getTime(), (testNow - minutes(20)) * 1000);
+    assert.equal(await statusOf(node), 'offline');
   });
 
-  test('under the limit nothing happens', async () => {
+  test('under the limit nothing happens, and each node has its own limit', async () => {
     const node = await newNode();
-    await sendFrom(node, { recorded_at: minutesAgo(14) });
+    const patient = await newNode({ settings: { quiet_minutes: 60 } });
+    await send(node, [{ ago: minutes(10) }]);
+    await send(patient, [{ ago: minutes(30) }]);
     await check();
-    assert.deepEqual(await alertsFor(node, 'quiet'), []);
+    assert.deepEqual(await alertsFor(node), []);
+    assert.deepEqual(await alertsFor(patient), []);
+  });
+
+  test('a node without QUIET in its alert types never gets one', async () => {
+    const node = await newNode({ settings: { alert_types: ['MOTION'] } });
+    await send(node, [{ ago: minutes(40) }]);
+    await check();
+    assert.deepEqual(await alertsFor(node), []);
   });
 
   test('resolving it does not bring it back during the same silence', async () => {
     const node = await newNode();
-    await sendFrom(node, { recorded_at: minutesAgo(20) });
-    await check();
-    const [alert] = await alertsFor(node, 'quiet');
+    await send(node, [{ ago: minutes(20) }]);
+    const [alert] = await alertsFor(node, 'QUIET');
     await call(officer, 'public.iot_resolve_alert($1)', [alert.id]);
     await check();
-    assert.equal((await alertsFor(node, 'quiet')).length, 1);
+    assert.equal((await alertsFor(node, 'QUIET')).length, 1);
   });
 
-  test('a new reading closes it by itself, and a later silence makes a new alert', async () => {
+  test('a new reading ends it by itself, and a later silence makes a new one', async () => {
     const node = await newNode();
-    await sendFrom(node, { recorded_at: minutesAgo(20) });
-    await check();
-    await sendFrom(node);
-    const [closed] = await alertsFor(node, 'quiet');
-    assert.equal(closed.status, 'resolved');
-    assert.equal(closed.closed_by_itself, true);
-    assert.equal(closed.resolved_by, null);
+    await send(node, [{ ago: minutes(20) }]);
+    await send(node, [{ ago: 30 }]);
+    let alerts = await alertsFor(node, 'QUIET');
+    assert.equal(alerts[0].cleared_recorded_at.getTime(), (testNow - 30) * 1000);
+    assert.equal(await statusOf(node), 'online');
 
+    // As if 30 minutes went by
     await db.query(
-      `UPDATE public.iot_readings SET recorded_at = recorded_at - INTERVAL '10 minutes'
-       WHERE node_id = $1`,
+      "UPDATE public.iot_readings SET recorded_at = recorded_at - interval '30 minutes' WHERE node_id = $1",
       [node],
     );
     await check();
-    assert.equal((await alertsFor(node, 'quiet')).length, 1);
-    await db.query(
-      `UPDATE public.iot_alerts SET first_seen_at = first_seen_at - INTERVAL '1 hour'
-       WHERE node_id = $1`,
-      [node],
-    );
-    await db.query(
-      `UPDATE public.iot_readings SET recorded_at = recorded_at - INTERVAL '10 minutes'
-       WHERE node_id = $1`,
-      [node],
-    );
-    await check();
-    const alerts = await alertsFor(node, 'quiet');
+    alerts = await alertsFor(node, 'QUIET');
     assert.equal(alerts.length, 2);
-    assert.equal(alerts[1].status, 'open');
+    assert.equal(alerts[1].cleared_at, null);
   });
 
-  test('an old reading from a buffer does not close it, because the node may still be quiet', async () => {
+  test('an old reading from a buffer does not end it, because the node may still be quiet', async () => {
     const node = await newNode();
-    await sendFrom(node, { recorded_at: minutesAgo(30) });
-    await check();
-    await sendFrom(node, { recorded_at: minutesAgo(20) });
-    const alerts = await alertsFor(node, 'quiet');
-    assert.equal(alerts.length, 1);
-    assert.equal(alerts[0].status, 'open');
+    await send(node, [{ ago: minutes(30) }]);
+    await send(node, [{ ago: minutes(20) }]);
+    const [alert] = await alertsFor(node, 'QUIET');
+    assert.equal(alert.cleared_at, null);
   });
 
-  test('if the battery was already low it is routine, because that is the likely reason', async () => {
-    const node = await newNode();
-    await sendFrom(node, { recorded_at: minutesAgo(20), battery_percent: 10 });
-    await check();
-    const [alert] = await alertsFor(node, 'quiet');
-    assert.equal(alert.severity, 'routine');
-  });
-
-  test('a delivery from any device catches a node that has stopped on another', async () => {
-    const node = await newNode('REGION-A');
-    await sendFrom(node);
+  test('an upload from any device catches a node that has stopped on another', async () => {
+    const node = await newNode({ device: 'REGION-B' });
     await db.query(
-      `UPDATE public.iot_readings SET recorded_at = now() - INTERVAL '20 minutes'
-       WHERE node_id = $1`,
+      `INSERT INTO public.iot_readings (device_id, node_id, boot_id, seq, recorded_at, ts_source, received_at)
+       VALUES ('REGION-B', $1, 1, 1, now() - interval '40 minutes', 'device', now() - interval '40 minutes')`,
       [node],
     );
-    await send('REGION-B', tokenB, []);
-    assert.equal((await alertsFor(node, 'quiet')).length, 1);
+    assert.deepEqual(await alertsFor(node), []);
+    await upload(keyA, { edge_id: 'REGION-A' });
+    assert.equal((await alertsFor(node, 'QUIET')).length, 1);
   });
 
   test('a node that has never sent anything is not quiet, so the sample nodes stay silent', async () => {
@@ -1037,42 +860,20 @@ describe('nodes going quiet', () => {
     await check();
     assert.deepEqual(await alertsFor(node), []);
     const { rows } = await db.query(
-      "SELECT count(*)::integer AS alerts FROM public.iot_alerts WHERE node_id LIKE 'NNP-IOT-%'",
+      "SELECT count(*)::int AS n FROM public.iot_alerts WHERE node_id NOT LIKE 'TEST_NODE-%'",
     );
-    assert.deepEqual(rows, [{ alerts: 0 }]);
-  });
-
-  test('the count for the staff menu only has alerts nobody has picked up', async () => {
-    const start = await check();
-    const node = await newNode();
-    await sendFrom(node, { tilt_degrees: 80, soil_moisture_percent: 5 });
-
-    const raised = await check();
-    assert.equal(raised.urgent, start.urgent + 1);
-    assert.equal(raised.open, start.open + 2);
-
-    const alerts = await alertsFor(node);
-    const urgent = alerts.find((alert) => alert.severity === 'urgent');
-    await call(officer, 'public.iot_acknowledge_alert($1)', [urgent.id]);
-    const picked = await check();
-    assert.equal(picked.urgent, start.urgent);
-    assert.equal(picked.open, start.open + 1);
-
-    const routine = alerts.find((alert) => alert.severity === 'routine');
-    await call(officer, 'public.iot_resolve_alert($1)', [routine.id]);
-    assert.equal((await check()).open, start.open);
+    assert.equal(rows[0].n, 0);
   });
 
   test('only officers and admins can check, and nobody can run the scan directly', async () => {
-    assert.ok(await call(admin, 'public.iot_check_alerts()'));
-    for (const user of [visitor, researcher, botanist]) {
-      await assert.rejects(call(user, 'public.iot_check_alerts()'), { code: '42501' }, who(user));
+    for (const user of [null, visitor, researcher, botanist]) {
+      await assert.rejects(check(user), { code: '42501' }, who(user));
     }
-    await assert.rejects(call(null, 'public.iot_check_alerts()'), notAllowed);
-    for (const user of [null, visitor, researcher, botanist, officer, admin]) {
+    assert.ok(await check(admin));
+    for (const user of [null, officer, admin]) {
       await assert.rejects(call(user, 'public.iot_raise_quiet_alerts()'), notAllowed, who(user));
       await assert.rejects(
-        call(user, "public.iot_raise_alert('x', 'quiet', 'urgent', 'x', 1, 1, now(), 1)"),
+        call(user, "public.iot_refresh_node_status(ARRAY['x'])"),
         notAllowed,
         who(user),
       );
@@ -1080,220 +881,623 @@ describe('nodes going quiet', () => {
   });
 });
 
-describe('the status view for the Sensors page', () => {
-  const sql = 'SELECT * FROM public.iot_node_status WHERE node_id = $1';
+describe('the count for the staff menu', () => {
+  const count = () => call(officer, 'public.iot_check_alerts()');
+  const change = (before, after) => ({ urgent: after.urgent - before.urgent, open: after.open - before.open });
 
-  test('it shows the newest reading, even when an older one arrives after it', async () => {
-    const node = await newNode();
-    await sendFrom(node, { temperature_c: 30 });
-    await sendFrom(node, { temperature_c: 20, recorded_at: minutesAgo(5) });
-    const [row] = await selectAs(db, officer, sql, [node]);
-    assert.equal(Number(row.temperature_c), 30);
-    assert.equal(row.quiet, false);
-  });
+  test('it counts alerts going on that nobody has picked up, and urgent ones apart', async () => {
+    const start = await count();
+    const urgent = await newNode();
+    await send(urgent, [{ ago: 60, motion: 1 }]);
+    assert.deepEqual(change(start, await count()), { urgent: 1, open: 1 });
 
-  test('it says when a node is quiet, and a node with no readings is not', async () => {
-    const stopped = await newNode();
-    await sendFrom(stopped, { recorded_at: minutesAgo(20) });
-    const [quiet] = await selectAs(db, officer, sql, [stopped]);
-    assert.equal(quiet.quiet, true);
+    const routine = await newNode({ settings: { alert_types: ['DRY', 'QUIET'] } });
+    await send(routine, [{ ago: 60, soil_raw: await soilAt(10) }]);
+    assert.deepEqual(change(start, await count()), { urgent: 1, open: 2 });
 
-    const unused = await newNode();
-    const [waiting] = await selectAs(db, officer, sql, [unused]);
-    assert.equal(waiting.quiet, false);
-    assert.equal(waiting.last_reading_at, null);
-    assert.equal(waiting.temperature_c, null);
-  });
+    // Acknowledged: someone is on it
+    const [alert] = await alertsFor(urgent);
+    await call(officer, 'public.iot_acknowledge_alert($1)', [alert.id]);
+    assert.deepEqual(change(start, await count()), { urgent: 0, open: 1 });
 
-  test('the made up numbers from 002 never show as readings', async () => {
-    const [seed] = await selectAs(db, officer, sql, ['NNP-IOT-01']);
-    assert.equal(seed.last_reading_at, null);
-    assert.equal(seed.temperature_c, null);
-    assert.equal(seed.battery_percent, null);
-    assert.equal(seed.humidity_percent, null);
-    assert.equal(seed.soil_moisture_percent, null);
-    assert.equal(seed.tilt_degrees, null);
-    assert.equal(seed.motion_detected, null);
-  });
+    // Ended by itself: nothing going on, though it still waits to be resolved
+    await send(routine, [{ ago: 30, soil_raw: await soilAt(50) }]);
+    assert.deepEqual(change(start, await count()), { urgent: 0, open: 0 });
 
-  test('it has no coordinates and none of the old columns from 001', async () => {
-    const { rows } = await db.query(`
-      SELECT column_name FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = 'iot_node_status'`);
-    const columns = rows.map((row) => row.column_name);
-    for (const left of ['latitude', 'longitude', 'status', 'last_heartbeat', 'threat_details']) {
-      assert.ok(!columns.includes(left), left);
-    }
-  });
-
-  test('only officers and admins get rows', async () => {
-    assert.equal((await selectAs(db, admin, sql, ['NNP-IOT-01'])).length, 1);
-    for (const user of [visitor, researcher, botanist]) {
-      assert.deepEqual(await selectAs(db, user, sql, ['NNP-IOT-01']), [], who(user));
-    }
-    await assert.rejects(selectAs(db, null, sql, ['NNP-IOT-01']), notAllowed);
+    // From an edge's backlog after an outage: kept, but not counted
+    const late = await newNode({ settings: { quiet_minutes: 600 } });
+    await send(late, [{ ago: 3 * 3600, temp_c: 48 }]);
+    assert.equal((await alertsFor(late))[0].from_backlog, true);
+    assert.deepEqual(change(start, await count()), { urgent: 0, open: 0 });
   });
 });
 
-describe('nothing from a node reaches the public', () => {
-  // Made up for this test, and nowhere near anything real
-  const latitude = 12.345678;
-  const longitude = 98.765432;
+describe('acknowledging and resolving', () => {
+  async function openAlert() {
+    const node = await newNode();
+    await send(node, [{ ago: 60, motion: 1 }]);
+    const [alert] = await alertsFor(node);
+    return { node, id: alert.id };
+  }
+
+  test('both say who and when, for officers and admins', async () => {
+    for (const user of [officer, admin]) {
+      const { node, id } = await openAlert();
+      const startedAt = new Date(Date.now() - 1000);
+      assert.deepEqual(await call(user, 'public.iot_acknowledge_alert($1)', [id]), {
+        id,
+        status: 'acknowledged',
+      });
+      // Someone is on it, but it's still going on, so the node still shows the threat
+      assert.equal(await statusOf(node), 'threat_triggered');
+      assert.deepEqual(await call(user, 'public.iot_resolve_alert($1)', [id]), { id, status: 'resolved' });
+      const [alert] = await alertsFor(node);
+      assert.equal(alert.acknowledged_by, user.id);
+      assert.equal(alert.acknowledged_by_name, user.name);
+      assert.ok(alert.acknowledged_at >= startedAt);
+      assert.equal(alert.resolved_by, user.id);
+      assert.equal(alert.resolved_by_name, user.name);
+      assert.ok(alert.resolved_at >= alert.acknowledged_at);
+      assert.equal(await statusOf(node), 'online');
+    }
+  });
+
+  test('an alert can be resolved without being acknowledged first', async () => {
+    const { node, id } = await openAlert();
+    await call(officer, 'public.iot_resolve_alert($1)', [id]);
+    const [alert] = await alertsFor(node);
+    assert.deepEqual([alert.status, alert.acknowledged_at], ['resolved', null]);
+  });
+
+  test('doing it twice keeps the first person', async () => {
+    const { node, id } = await openAlert();
+    await call(officer, 'public.iot_acknowledge_alert($1)', [id]);
+    await call(admin, 'public.iot_acknowledge_alert($1)', [id]);
+    await call(officer, 'public.iot_resolve_alert($1)', [id]);
+    assert.deepEqual(await call(admin, 'public.iot_resolve_alert($1)', [id]), { id, status: 'resolved' });
+    // Acknowledging a resolved alert changes nothing either
+    assert.deepEqual(await call(admin, 'public.iot_acknowledge_alert($1)', [id]), { id, status: 'resolved' });
+    const [alert] = await alertsFor(node);
+    assert.equal(alert.acknowledged_by_name, 'Park officer');
+    assert.equal(alert.resolved_by_name, 'Park officer');
+  });
+
+  test('anyone else is turned down and the alert stays as it was', async () => {
+    const { node, id } = await openAlert();
+    for (const user of [null, visitor, researcher, botanist]) {
+      for (const fn of ['iot_acknowledge_alert', 'iot_resolve_alert']) {
+        await assert.rejects(call(user, `public.${fn}($1)`, [id]), { code: '42501' }, `${who(user)} ${fn}`);
+      }
+    }
+    assert.equal((await alertsFor(node))[0].status, 'open');
+  });
+
+  test('an alert that does not exist gets a clear answer', async () => {
+    await assert.rejects(call(officer, 'public.iot_acknowledge_alert($1)', [987654321]), /no alert/);
+    await assert.rejects(call(officer, 'public.iot_resolve_alert($1)', [987654321]), /no alert/);
+  });
+
+  test('a routine alert that is resolved takes the node back to online', async () => {
+    const node = await newNode({ settings: { alert_types: ['RAIN', 'QUIET'] } });
+    await send(node, [{ ago: 60, rain_raw: await rainAt(30) }]);
+    assert.equal(await statusOf(node), 'warning');
+    const [alert] = await alertsFor(node);
+    await call(officer, 'public.iot_resolve_alert($1)', [alert.id]);
+    assert.equal(await statusOf(node), 'online');
+  });
+});
+
+describe('commands for the nodes', () => {
+  const sendCommand = (user, node, command) => insertAs(db, user, 'public.iot_commands', { node_id: node, command });
+
+  async function commandsFor(node) {
+    const { rows } = await db.query('SELECT * FROM public.iot_commands WHERE node_id = $1 ORDER BY created_at', [node]);
+    return rows;
+  }
+
+  test('officers and admins send one, and the database fills in who and when', async () => {
+    const node = await newNode();
+    for (const user of [officer, admin]) {
+      await sendCommand(user, node, 'beep_on');
+    }
+    const commands = await commandsFor(node);
+    assert.deepEqual(
+      commands.map((c) => [c.command, c.status, c.created_by, c.created_by_name]),
+      [
+        ['beep_on', 'pending', officer.id, 'Park officer'],
+        ['beep_on', 'pending', admin.id, 'Park admin'],
+      ],
+    );
+    const hour = commands[0].expires_at.getTime() - commands[0].created_at.getTime();
+    assert.equal(hour, 3600 * 1000);
+  });
+
+  test('nobody else can, and nobody picks the sender, the status or the times', async () => {
+    const node = await newNode();
+    for (const user of [visitor, researcher, botanist]) {
+      await assert.rejects(sendCommand(user, node, 'beep_on'), notTheirRole, who(user));
+    }
+    await assert.rejects(sendCommand(null, node, 'beep_on'), notAllowed);
+    for (const column of ['created_by_name', 'status', 'expires_at', 'result']) {
+      await assert.rejects(
+        insertAs(db, officer, 'public.iot_commands', { node_id: node, command: 'beep_on', [column]: null }),
+        notAllowed,
+        column,
+      );
+    }
+    await assert.rejects(sendCommand(officer, node, 'self_destruct'), /check/);
+    await sendCommand(officer, node, 'beep_off');
+    for (const sql of [
+      "UPDATE public.iot_commands SET status = 'done' WHERE node_id = $1",
+      'DELETE FROM public.iot_commands WHERE node_id = $1',
+    ]) {
+      await assert.rejects(selectAs(db, admin, sql, [node]), notAllowed, sql);
+    }
+  });
+
+  test('edge-com hands a command to its node’s edge, and follows it to the end', async () => {
+    const node = await newNode();
+    await sendCommand(officer, node, 'reset_baseline');
+    const [command] = await commandsFor(node);
+
+    // Another region's edge doesn't get it, and can't change it
+    let answer = await upload(keyB, {
+      edge_id: 'REGION-B',
+      cal_since: Number.MAX_SAFE_INTEGER,
+      command_updates: [{ id: command.id, status: 'done', done_at: new Date().toISOString() }],
+    });
+    assert.ok(!(answer.body?.commands ?? []).some((c) => c.id === command.id));
+    assert.equal((await commandsFor(node))[0].status, 'pending');
+
+    answer = await send(node, []);
+    assert.equal(answer.status, 200);
+    const handed = answer.body.commands.find((c) => c.id === command.id);
+    assert.deepEqual([handed.node_id, handed.command], [node, 'reset_baseline']);
+
+    const times = [3, 2, 1, 0].map((s) => new Date(Date.now() - s * 1000).toISOString());
+    const at = (s) => times[3 - s];
+    const report = (update) => send(node, [], { batch: { command_updates: [{ id: command.id, ...update }] } });
+    await report({ status: 'at_edge', at_edge_at: at(3) });
+    // Once the edge has it, it isn't handed out again
+    answer = await send(node, []);
+    assert.ok(!(answer.body?.commands ?? []).some((c) => c.id === command.id));
+    await report({ status: 'sent', sent_at: at(2) });
+    await report({ status: 'done', done_at: at(1), result: 'baseline 118.2 cm' });
+    // An old report that arrives late doesn't take it back
+    await report({ status: 'sent', sent_at: at(0) });
+    const [done] = await commandsFor(node);
+    assert.equal(done.status, 'done');
+    assert.equal(done.result, 'baseline 118.2 cm');
+    assert.equal(done.sent_at.toISOString(), at(2));
+    assert.notEqual(done.at_edge_at, null);
+    assert.notEqual(done.done_at, null);
+  });
+
+  test('a command no edge picked up within the hour expires', async () => {
+    const node = await newNode();
+    await sendCommand(officer, node, 'beep_on');
+    await db.query("UPDATE public.iot_commands SET expires_at = now() - interval '1 second' WHERE node_id = $1", [node]);
+    const answer = await upload(keyB, { edge_id: 'REGION-B', cal_since: Number.MAX_SAFE_INTEGER });
+    assert.ok(!(answer.body?.commands ?? []).some((c) => c.node_id === node));
+    const [command] = await commandsFor(node);
+    assert.equal(command.status, 'expired');
+    assert.notEqual(command.done_at, null);
+  });
+
+  test('an update that is not a real one is skipped and the rest of the batch goes in', async () => {
+    const node = await newNode();
+    const answer = await send(node, [{ ago: 10 }], {
+      batch: {
+        command_updates: [
+          { id: 'not-a-uuid', status: 'done' },
+          { id: '00000000-0000-4000-8000-000000000000', status: 'exploded' },
+          { id: '00000000-0000-4000-8000-000000000000', status: 'done', done_at: 'yesterday' },
+        ],
+      },
+    });
+    // 200 if another test left a command waiting for this region's nodes
+    assert.ok([200, 204].includes(answer.status), `${answer.status}`);
+    assert.equal((await storedReadings(node)).length, 1);
+  });
+});
+
+describe('calibration and alert settings', () => {
+  let key;
+
+  before(async () => {
+    await insertAs(db, admin, 'public.iot_devices', { device_id: 'CAL-REGION', name: 'Calibration' });
+    key = (await makeToken(admin, 'CAL-REGION')).token;
+  });
+
+  test('edge-com sends the settings the edge does not have yet, for its own nodes only', async () => {
+    const first = await newNode({ device: 'CAL-REGION' });
+    const second = await newNode({ device: 'CAL-REGION' });
+    let answer = await upload(key, { edge_id: 'CAL-REGION', cal_since: 0 });
+    assert.deepEqual(answer.body.calibration.map((c) => c.node_id), [first, second]);
+    const [cal] = answer.body.calibration;
+    assert.deepEqual(Object.keys(cal).sort(), [
+      'alert_confirm_readings', 'alert_types', 'motion_confirm_readings', 'move_cm', 'node_id',
+      'rain_dry_raw', 'rain_heavy_pct', 'rain_light_pct', 'rain_wet_raw', 'soil_dry_pct',
+      'soil_dry_raw', 'soil_flood_pct', 'soil_wet_raw', 'v',
+    ]);
+    const newest = answer.body.calibration.at(-1).v;
+    assert.equal((await upload(key, { edge_id: 'CAL-REGION', cal_since: newest })).status, 204);
+
+    // A change to a setting the edge uses gives that node a new version
+    await selectAs(db, admin, 'UPDATE public.iot_nodes SET soil_flood_pct = 90 WHERE node_id = $1', [first]);
+    answer = await upload(key, { edge_id: 'CAL-REGION', cal_since: newest });
+    assert.deepEqual(
+      answer.body.calibration.map((c) => [c.node_id, c.soil_flood_pct]),
+      [[first, 90]],
+    );
+    assert.ok(answer.body.calibration[0].v > newest);
+  });
+
+  test('a setting only the cloud uses, or setting cal_version itself, gives no new version', async () => {
+    const node = await newNode({ device: 'CAL-REGION' });
+    const version = async () => Number((await nodeRow(node)).cal_version);
+    const before = await version();
+    await selectAs(db, admin, 'UPDATE public.iot_nodes SET quiet_minutes = 30, too_hot_c = 40, too_hot_clear_c = 35 WHERE node_id = $1', [node]);
+    assert.equal(await version(), before);
+    await db.query('UPDATE public.iot_nodes SET cal_version = 1 WHERE node_id = $1', [node]);
+    assert.equal(await version(), before);
+  });
+
+  test('only admins change the settings, and nonsense ones are turned down', async () => {
+    const node = await newNode({ device: 'CAL-REGION' });
+    const set = (user, sql) => selectAs(db, user, `UPDATE public.iot_nodes SET ${sql} WHERE node_id = $1 RETURNING node_id`, [node]);
+    assert.deepEqual(await set(officer, 'move_cm = 20'), []);
+    assert.equal((await nodeRow(node)).move_cm, 10);
+    for (const [sql, rule] of [
+      ['soil_flood_clear_pct = 90', /iot_nodes_cal_ranges/],
+      ['soil_dry_raw = 1400', /iot_nodes_cal_ranges/],
+      ['too_hot_c = 60', /check/],
+      ['alert_types = ARRAY[\'FIRE\']', /check/],
+      ['quiet_minutes = 0', /check/],
+      ['alert_confirm_readings = 11', /check/],
+    ]) {
+      await assert.rejects(set(admin, sql), rule, sql);
+    }
+    assert.deepEqual(await set(admin, 'move_cm = 20, move_clear_cm = 15'), [{ node_id: node }]);
+  });
+
+  test('a node’s own settings decide its alerts straight away', async () => {
+    const node = await newNode({ device: 'CAL-REGION', settings: { too_hot_c: 35, too_hot_clear_c: 33 } });
+    await send(node, [{ ago: 60, temp_c: 36 }], { device: 'CAL-REGION', key });
+    assert.deepEqual((await alertsFor(node)).map((a) => a.type), ['TOO_HOT']);
+  });
+});
+
+describe('who reads and changes what', () => {
+  const STAFF_READS = ['iot_readings', 'iot_alerts', 'iot_boots', 'iot_commands', 'iot_node_status', 'iot_devices', 'iot_nodes'];
   let node;
 
   before(async () => {
     node = await newNode();
-    await sendFrom(node, { latitude, longitude });
+    await send(node, [{ ago: 20, motion: 1 }], {
+      batch: { boots: [{ node_id: node, boot_id: 1, lat: 3.81, lon: 113.78, at: new Date().toISOString() }] },
+    });
+    await insertAs(db, officer, 'public.iot_commands', { node_id: node, command: 'beep_on' });
   });
 
-  test('anon reads the same three views as before, and no IoT table', async () => {
-    const { rows } = await db.query(`
-      SELECT c.relname
-      FROM pg_class AS c
-      WHERE c.relnamespace = 'public'::regnamespace
-        AND c.relkind IN ('r', 'v', 'm')
-        AND has_table_privilege('anon', c.oid, 'SELECT')
-      ORDER BY 1`);
-    assert.deepEqual(
-      rows.map((row) => row.relname),
-      ['records_public', 'species_photos_public', 'species_public'],
-    );
+  test('only officers and admins read the sensor tables', async () => {
+    for (const table of STAFF_READS) {
+      for (const user of [officer, admin]) {
+        const rows = await selectAs(db, user, `SELECT * FROM public.${table}`);
+        assert.ok(rows.length > 0, `${who(user)} reading ${table}`);
+      }
+      for (const user of [visitor, researcher, botanist]) {
+        assert.deepEqual(await selectAs(db, user, `SELECT * FROM public.${table}`), [], `${who(user)} reading ${table}`);
+      }
+      await assert.rejects(selectAs(db, null, `SELECT * FROM public.${table}`), notAllowed, `anon reading ${table}`);
+    }
   });
 
-  test('what the public views show has nothing from a node in it', async () => {
-    for (const view of ['records_public', 'species_photos_public', 'species_public']) {
-      const rows = await selectAs(db, null, `SELECT * FROM public.${view}`);
-      const text = JSON.stringify(rows);
-      for (const bit of [String(latitude), String(longitude), node, 'REGION-A', 'NNP-IOT']) {
-        assert.ok(!text.includes(bit), `${view} has ${bit}`);
+  test('edge-com’s own tables are closed to everyone, admins included', async () => {
+    for (const table of ['iot_device_tokens', 'iot_alert_state']) {
+      for (const user of [null, officer, admin]) {
+        await assert.rejects(selectAs(db, user, `SELECT * FROM public.${table}`), notAllowed, `${who(user)} ${table}`);
       }
     }
   });
 
-  test('no view other than the staff one reads the IoT tables', async () => {
-    const { rows } = await db.query(`
-      SELECT viewname FROM pg_views
-      WHERE schemaname = 'public' AND definition ~ 'iot_'
-      ORDER BY 1`);
-    assert.deepEqual(rows, [{ viewname: 'iot_node_status' }]);
+  test('nobody adds, changes or removes a reading, an alert or a power-up directly, admins included', async () => {
+    for (const user of [officer, admin]) {
+      for (const sql of [
+        "INSERT INTO public.iot_readings (device_id, node_id, boot_id, seq, recorded_at, ts_source, received_at) VALUES ('REGION-A', 'x', 1, 1, now(), 'edge', now())",
+        'UPDATE public.iot_readings SET temp_c = 1',
+        'DELETE FROM public.iot_readings',
+        "INSERT INTO public.iot_alerts (node_id, node_name, device_id, type, severity, recorded_at, confirmed_recorded_at) VALUES ('x', 'x', 'REGION-A', 'QUIET', 'urgent', now(), now())",
+        "UPDATE public.iot_alerts SET status = 'resolved', resolved_at = now()",
+        'DELETE FROM public.iot_alerts',
+        "INSERT INTO public.iot_boots (node_id, boot_id) VALUES ('x', 1)",
+        'UPDATE public.iot_boots SET latitude = 1, longitude = 1',
+        'DELETE FROM public.iot_boots',
+      ]) {
+        await assert.rejects(selectAs(db, user, sql), notAllowed, `${who(user)}: ${sql}`);
+      }
+    }
   });
 
-  test('the staff view does not show coordinates either', async () => {
-    const [row] = await selectAs(db, officer, 'SELECT * FROM public.iot_node_status WHERE node_id = $1', [
-      node,
+  test('officers see the devices, and only admins add, change or remove one', async () => {
+    await assert.rejects(
+      insertAs(db, officer, 'public.iot_devices', { device_id: 'OFFICER-ADDS', name: 'No' }),
+      notTheirRole,
+    );
+    assert.deepEqual(
+      await selectAs(db, officer, "UPDATE public.iot_devices SET name = 'Renamed' WHERE device_id = 'REGION-A' RETURNING device_id"),
+      [],
+    );
+    assert.deepEqual(
+      await selectAs(db, officer, "DELETE FROM public.iot_devices WHERE device_id = 'HASH-TEST' RETURNING device_id"),
+      [],
+    );
+    await insertAs(db, admin, 'public.iot_devices', {
+      device_id: 'PLACED',
+      name: 'Placed',
+      zone: 'North',
+      latitude: 3.81,
+      longitude: 113.78,
+    });
+    const [placed] = await selectAs(db, officer, "SELECT * FROM public.iot_devices WHERE device_id = 'PLACED'");
+    assert.deepEqual([placed.zone, placed.latitude, placed.longitude, placed.enabled], ['North', 3.81, 113.78, true]);
+    // A position is both halves or neither, and on the Earth
+    for (const sql of ['latitude = NULL', 'latitude = 91', 'longitude = -181']) {
+      await assert.rejects(
+        selectAs(db, admin, `UPDATE public.iot_devices SET ${sql} WHERE device_id = 'PLACED'`),
+        /latitude|longitude/,
+        sql,
+      );
+    }
+    await assert.rejects(
+      insertAs(db, admin, 'public.iot_devices', { device_id: 'x', name: 'Too short' }),
+      /check/,
+    );
+  });
+
+  test('only admins link a node to a device', async () => {
+    const linked = await newNode({ device: null });
+    const link = (user) =>
+      selectAs(db, user, "UPDATE public.iot_nodes SET edge_device_id = 'REGION-B' WHERE node_id = $1 RETURNING node_id", [linked]);
+    assert.deepEqual(await link(officer), []);
+    assert.deepEqual(await link(admin), [{ node_id: linked }]);
+  });
+
+  test("a device or node with history can't be removed, and one without can", async () => {
+    const remove = (table, column, id) =>
+      selectAs(db, admin, `DELETE FROM public.${table} WHERE ${column} = $1 RETURNING ${column}`, [id]);
+    await assert.rejects(remove('iot_devices', 'device_id', 'REGION-A'), { code: '23503' });
+    await assert.rejects(remove('iot_nodes', 'node_id', node), { code: '23503' });
+
+    const unused = await newNode({ device: 'PLACED' });
+    assert.deepEqual(await remove('iot_nodes', 'node_id', unused), [{ node_id: unused }]);
+    // Removing a device takes its token with it, and leaves its nodes unlinked
+    const orphan = await newNode({ device: 'PLACED' });
+    await makeToken(admin, 'PLACED');
+    assert.deepEqual(await remove('iot_devices', 'device_id', 'PLACED'), [{ device_id: 'PLACED' }]);
+    assert.equal((await nodeRow(orphan)).edge_device_id, null);
+    const { rows } = await db.query("SELECT 1 FROM public.iot_device_tokens WHERE device_id = 'PLACED'");
+    assert.deepEqual(rows, []);
+  });
+
+  test('every sensor table has Row Level Security on', async () => {
+    const { rows } = await db.query(
+      `SELECT relname, relrowsecurity FROM pg_class
+       WHERE relnamespace = 'public'::regnamespace AND relkind = 'r' AND relname LIKE 'iot\\_%'
+       ORDER BY relname`,
+    );
+    assert.deepEqual(
+      rows.map((row) => row.relname),
+      ['iot_alert_state', 'iot_alerts', 'iot_boots', 'iot_commands', 'iot_device_tokens', 'iot_devices', 'iot_nodes', 'iot_readings'],
+    );
+    for (const row of rows) assert.equal(row.relrowsecurity, true, row.relname);
+  });
+
+  test('every sensor function has its search path locked and only the grants it needs', async () => {
+    const { rows } = await db.query(
+      `SELECT p.oid::regprocedure::text AS fn, p.proconfig,
+         has_function_privilege('anon', p.oid, 'EXECUTE') AS anon,
+         has_function_privilege('authenticated', p.oid, 'EXECUTE') AS authenticated,
+         has_function_privilege('service_role', p.oid, 'EXECUTE') AS service
+       FROM pg_proc AS p
+       WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'iot\\_%'
+       ORDER BY 1`,
+    );
+    const forStaff = new Set([
+      'iot_acknowledge_alert(bigint)',
+      'iot_check_alerts()',
+      'iot_make_device_token(text)',
+      'iot_raw_pct(integer,integer,integer)',
+      'iot_resolve_alert(bigint)',
     ]);
-    assert.ok(!JSON.stringify(row).includes(String(latitude)));
+    assert.ok(rows.length >= 9);
+    for (const row of rows) {
+      assert.deepEqual(row.proconfig, ['search_path=""'], row.fn);
+      assert.equal(row.anon, false, `anon runs ${row.fn}`);
+      assert.equal(row.authenticated, forStaff.has(row.fn), `authenticated runs ${row.fn}`);
+      if (!forStaff.has(row.fn)) assert.equal(row.service, false, `service_role runs ${row.fn}`);
+    }
+  });
+});
+
+describe('the status view for the Sensors page', () => {
+  const view = async (node) =>
+    (await selectAs(db, officer, 'SELECT * FROM public.iot_node_status WHERE node_id = $1', [node]))[0];
+
+  test('it shows the newest reading, even when an older one arrives after it', async () => {
+    const node = await newNode();
+    await send(node, [{ ago: 60, temp_c: 30 }]);
+    await send(node, [{ ago: 120, temp_c: 20 }]);
+    const row = await view(node);
+    assert.equal(row.temp_c, 30);
+    assert.equal(row.last_reading_at.getTime(), (testNow - 60) * 1000);
   });
 
-  test('the only IoT function anon can call is the one that adds readings', async () => {
-    const { rows } = await db.query(`
-      SELECT p.proname
-      FROM pg_proc AS p
-      WHERE p.pronamespace = 'public'::regnamespace
-        AND has_function_privilege('anon', p.oid, 'EXECUTE')
-        AND (p.proname LIKE 'iot\\_%' OR p.prosrc ~ 'iot_')
-      ORDER BY 1`);
-    assert.deepEqual(rows, [{ proname: 'iot_add_readings' }]);
+  test('it works out each state with the node’s own limits', async () => {
+    const node = await newNode({ settings: { alert_types: ['QUIET'] } });
+    // Each one a little newer than the one before
+    let ago = 40;
+    const states = async (changes) => {
+      ago -= 10;
+      await send(node, [{ ago, ...changes }]);
+      const row = await view(node);
+      return [row.temp_state, row.soil_state, row.rain_state, row.dist_state];
+    };
+    assert.deepEqual(await states({}), ['NORMAL', 'NORMAL', 'NONE', 'OK']);
+    assert.deepEqual(
+      await states({ temp_c: 45, soil_raw: await soilAt(85), rain_raw: await rainAt(20), dist_cm: 131 }),
+      ['TOO_HOT', 'SATURATED', 'RAIN', 'MOVED'],
+    );
+    assert.deepEqual(
+      await states({ soil_raw: await soilAt(20), rain_raw: await rainAt(60), dist_cm: null }),
+      ['NORMAL', 'DRY', 'HEAVY', 'NO_ECHO'],
+    );
+    assert.deepEqual(await states({ temp_c: null, soil_raw: null, rain_raw: null }), [null, null, null, 'OK']);
   });
 
-  test('officers and admins can read the coordinates in the table', async () => {
-    const sql = 'SELECT latitude, longitude FROM public.iot_readings WHERE node_id = $1';
-    const [row] = await selectAs(db, officer, sql, [node]);
-    assert.equal(Number(row.latitude), latitude);
-    assert.equal(Number(row.longitude), longitude);
+  test('it says when a node is quiet, and a node with no readings is empty and not quiet', async () => {
+    const quiet = await newNode();
+    await send(quiet, [{ ago: 20 * 60 }]);
+    assert.equal((await view(quiet)).quiet, true);
+    assert.equal((await view(quiet)).open_alerts, 1);
+
+    const row = await view(await newNode());
+    assert.equal(row.quiet, false);
+    for (const column of ['last_reading_at', 'temp_c', 'soil_pct', 'soil_state', 'dist_state', 'motion']) {
+      assert.equal(row[column], null, column);
+    }
+  });
+
+  test('it counts alerts going on, and leaves out ended and resolved ones', async () => {
+    const node = await newNode();
+    await send(node, [{ ago: 120, motion: 1, temp_c: 46 }, { ago: 60, temp_c: 46 }, { ago: 30, temp_c: 46 }]);
+    const row = await view(node);
+    assert.deepEqual([Number(row.open_alerts), Number(row.urgent_alerts)], [1, 1]);
+  });
+
+  test('the made-up numbers from 001 never show, and their columns are gone', async () => {
+    const { rows } = await db.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name IN ('iot_nodes', 'iot_node_status')`,
+    );
+    const columns = new Set(rows.map((row) => row.column_name));
+    for (const gone of ['battery_percent', 'temperature_c', 'humidity_percent', 'soil_moisture_percent',
+      'pir_movement_detected', 'tilt_alert', 'threat_details', 'latitude', 'longitude']) {
+      assert.ok(!columns.has(gone), gone);
+    }
+  });
+
+  test('only officers and admins get rows', async () => {
+    for (const user of [visitor, researcher, botanist]) {
+      assert.deepEqual(await selectAs(db, user, 'SELECT * FROM public.iot_node_status'), [], who(user));
+    }
+  });
+});
+
+describe('nothing from a node reaches the public', () => {
+  test('anon has no grant on anything with iot_ in its name', async () => {
+    const { rows } = await db.query(
+      `SELECT relname FROM pg_class
+       WHERE relnamespace = 'public'::regnamespace AND relname LIKE 'iot\\_%' AND relkind IN ('r', 'v')
+         AND (has_table_privilege('anon', oid, 'SELECT') OR has_table_privilege('anon', oid, 'INSERT')
+           OR has_table_privilege('anon', oid, 'UPDATE') OR has_table_privilege('anon', oid, 'DELETE'))`,
+    );
+    assert.deepEqual(rows, []);
+  });
+
+  test('no view other than the staff one reads the sensor tables', async () => {
+    const { rows } = await db.query(
+      `SELECT DISTINCT view_name FROM information_schema.view_table_usage
+       WHERE table_schema = 'public' AND table_name LIKE 'iot\\_%'`,
+    );
+    assert.deepEqual(rows, [{ view_name: 'iot_node_status' }]);
+  });
+
+  test("a node's position is only in iot_boots, which only officers and admins read", async () => {
+    const { rows } = await db.query(
+      `SELECT DISTINCT table_name FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name LIKE 'iot\\_%' AND column_name IN ('latitude', 'longitude')
+       ORDER BY table_name`,
+    );
+    // The edge devices have a position too: they sit at a ranger station, not by a plant
+    assert.deepEqual(rows.map((row) => row.table_name), ['iot_boots', 'iot_devices']);
   });
 });
 
 describe('the order the files run in', () => {
-  test('016 stops on its first line if 015 has not been run', async () => {
-    const partWay = await newDatabase(
-      SQL_FILES.slice(0, SQL_FILES.indexOf('015_species_rough_area.sql')),
-    );
+  test('each sensor file stops on its first line if the one before it has not been run', async () => {
+    let ran = SQL_FILES.indexOf('015_species_rough_area.sql');
+    const fresh = await newDatabase(SQL_FILES.slice(0, ran));
     try {
-      await assert.rejects(partWay.exec(readSql('016_iot_readings.sql')), /016 needs 015/);
-      const { rows } = await partWay.query("SELECT to_regclass('public.iot_devices') AS found");
-      assert.deepEqual(rows, [{ found: null }]);
+      // Each file and the one it needs before it. 022 needs 021, which runs after 017 like 019
+      // and 020.
+      const needs = [['016_1_iot_devices.sql', '015_species_rough_area.sql']];
+      for (let i = 1; i < IOT_FILES.length; i += 1) {
+        needs.push([IOT_FILES[i], IOT_FILES[i] === '022_iot_reading_limit.sql' ? '021_role_changes.sql' : IOT_FILES[i - 1]]);
+      }
+      for (const [file, before] of needs) {
+        const prefix = file.split('_iot_')[0];
+        await assert.rejects(
+          fresh.exec(readSql(file)),
+          { message: `${prefix} needs ${before} to be run first` },
+          file,
+        );
+        // Everything up to the one it needs
+        for (; ran <= SQL_FILES.indexOf(before); ran += 1) await fresh.exec(readSql(SQL_FILES[ran]));
+      }
+      await fresh.exec(readSql(IOT_FILES.at(-1)));
     } finally {
-      await partWay.close();
-    }
-  });
-
-  test('017 stops on its first line if 016 has not been run', async () => {
-    const partWay = await newDatabase(
-      SQL_FILES.slice(0, SQL_FILES.indexOf('016_iot_readings.sql')),
-    );
-    try {
-      await assert.rejects(partWay.exec(readSql('017_iot_alerts.sql')), /017 needs 016/);
-      const { rows } = await partWay.query("SELECT to_regclass('public.iot_alerts') AS found");
-      assert.deepEqual(rows, [{ found: null }]);
-    } finally {
-      await partWay.close();
-    }
-  });
-});
-
-describe('running 016 and 017 again', () => {
-  async function catalogs() {
-    const queries = [
-      `SELECT tablename, policyname, cmd, roles::text[] AS roles, qual, with_check
-       FROM pg_policies WHERE tablename LIKE 'iot\\_%' ORDER BY 1, 2`,
-      `SELECT c.relname, c.relkind::text AS kind, c.relrowsecurity, c.reloptions,
-         ARRAY(SELECT acl::text FROM unnest(c.relacl) AS acl ORDER BY 1) AS acl
-       FROM pg_class AS c
-       WHERE c.relnamespace = 'public'::regnamespace AND c.relname LIKE 'iot\\_%'
-       ORDER BY 1`,
-      `SELECT c.relname, a.attname,
-         ARRAY(SELECT acl::text FROM unnest(a.attacl) AS acl ORDER BY 1) AS acl
-       FROM pg_attribute AS a
-       JOIN pg_class AS c ON c.oid = a.attrelid
-       WHERE c.relnamespace = 'public'::regnamespace AND c.relname LIKE 'iot\\_%'
-         AND a.attacl IS NOT NULL
-       ORDER BY 1, 2`,
-      `SELECT definition FROM pg_views WHERE viewname = 'iot_node_status'`,
-      `SELECT p.oid::regprocedure::text AS function, p.prosecdef, p.proconfig, p.prosrc,
-         ARRAY(SELECT acl::text FROM unnest(p.proacl) AS acl ORDER BY 1) AS acl
-       FROM pg_proc AS p
-       WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE 'iot\\_%'
-       ORDER BY 1`,
-      `SELECT tgrelid::regclass::text AS table_name, tgname, tgtype, tgenabled::text AS enabled
-       FROM pg_trigger
-       WHERE NOT tgisinternal AND tgrelid::regclass::text LIKE 'public.iot\\_%'
-       ORDER BY 1, 2`,
-      `SELECT conrelid::regclass::text AS table_name, conname, pg_get_constraintdef(oid) AS definition
-       FROM pg_constraint
-       WHERE connamespace = 'public'::regnamespace AND conrelid::regclass::text LIKE 'public.iot\\_%'
-       ORDER BY 1, 2`,
-      `SELECT indexname, indexdef FROM pg_indexes WHERE tablename LIKE 'iot\\_%' ORDER BY 1`,
-    ];
-    const results = [];
-    for (const query of queries) {
-      results.push((await db.query(query)).rows);
-    }
-    return results;
-  }
-
-  test('ends up the same, and keeps the readings, the tokens and any tuned limits', async () => {
-    const node = await newNode();
-    await sendFrom(node, { tilt_degrees: 80 });
-    await db.query('UPDATE public.iot_alert_limits SET quiet_minutes = 16');
-    try {
-      const firstTime = await catalogs();
-      await db.exec(readSql('016_iot_readings.sql'));
-      await db.exec(readSql('017_iot_alerts.sql'));
-      assert.deepEqual(await catalogs(), firstTime);
-
-      const { rows } = await db.query('SELECT quiet_minutes FROM public.iot_alert_limits');
-      assert.deepEqual(rows, [{ quiet_minutes: 16 }]);
-      assert.equal((await storedReadings(node)).length, 1);
-      assert.equal((await alertsFor(node)).length, 1);
-      assert.equal((await sendFrom(node)).accepted, 1);
-    } finally {
-      await db.query('UPDATE public.iot_alert_limits SET quiet_minutes = 15');
+      await fresh.close();
     }
   });
 });
 
-describe('through the stand-in, the way a device and the website do it', () => {
+describe('running the sensor files again', () => {
+  test('ends up the same, and keeps the readings, the tokens, the settings and the alerts', async () => {
+    const again = await newDatabase();
+    const otherEdge = await startEdgeCom(again, { output: { log() {}, warn() {}, error: console.error } });
+    try {
+      const owner = await addUser(again, { role: 'admin', name: 'Owner' });
+      await insertAs(again, owner, 'public.iot_devices', { device_id: 'AGAIN', name: 'Again' });
+      const { rows: made } = await asUser(again, owner, (tx) => tx.query("SELECT public.iot_make_device_token('AGAIN') AS t"));
+      const key = made[0].t.token;
+      await again.query("UPDATE public.iot_nodes SET edge_device_id = 'AGAIN', soil_flood_pct = 88 WHERE node_id = (SELECT min(node_id) FROM public.iot_nodes)");
+      const node = (await again.query("SELECT node_id FROM public.iot_nodes WHERE edge_device_id = 'AGAIN'")).rows[0].node_id;
+      const rows = [[1, nowSeconds() - 30, 1, 26, 80, 2600, 4095, 120, 120, 0, -60, 1]];
+      await otherEdge.upload(key, { edge_id: 'AGAIN', nodes: [{ node_id: node, boot_id: 1, rows }] });
+
+      const snapshot = async () => {
+        const parts = {};
+        for (const [name, sql] of Object.entries({
+          columns: `SELECT table_name, column_name, data_type, column_default FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name LIKE 'iot\\_%' ORDER BY 1, 2`,
+          policies: "SELECT tablename, policyname, cmd, qual, with_check FROM pg_policies WHERE tablename LIKE 'iot\\_%' ORDER BY 1, 2",
+          grants: `SELECT table_name, grantee, privilege_type FROM information_schema.role_table_grants
+                   WHERE table_schema = 'public' AND table_name LIKE 'iot\\_%' ORDER BY 1, 2, 3`,
+          constraints: "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conrelid::regclass::text LIKE 'iot\\_%' ORDER BY 1",
+          readings: 'SELECT count(*)::int AS n FROM public.iot_readings',
+          alerts: 'SELECT type, status FROM public.iot_alerts ORDER BY id',
+          settings: 'SELECT node_id, soil_flood_pct, edge_device_id, cal_version FROM public.iot_nodes ORDER BY node_id',
+          token: "SELECT encode(token_hash, 'hex') AS h FROM public.iot_device_tokens",
+        })) {
+          parts[name] = (await again.query(sql)).rows;
+        }
+        return parts;
+      };
+      const first = await snapshot();
+      assert.equal(first.alerts.length, 1);
+      for (const file of IOT_FILES) await again.exec(readSql(file));
+      assert.deepEqual(await snapshot(), first);
+      // And the token still works
+      assert.equal((await otherEdge.upload(key, { edge_id: 'AGAIN', cal_since: Number.MAX_SAFE_INTEGER })).status, 204);
+    } finally {
+      await otherEdge.close();
+      await again.close();
+    }
+  });
+});
+
+describe('through the stand-in, the way an edge and the website do it', () => {
   const [officerLogin, adminLogin, botanistLogin, , visitorLogin] = TEST_USERS;
   const representation = { Prefer: 'return=representation' };
   let standIn;
@@ -1316,6 +1520,17 @@ describe('through the stand-in, the way a device and the website do it', () => {
     return { status: response.status, body: text ? JSON.parse(text) : null };
   }
 
+  /** Uploads the way cloud-com.py does: gzipped, with only the device's token, no anon key. */
+  async function edgeUpload(key, batch) {
+    const response = await fetch(`${standIn.url}/functions/v1/edge-com`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'x-edge-key': key },
+      body: gzipSync(JSON.stringify(batch)),
+    });
+    const text = await response.text();
+    return { status: response.status, body: text ? JSON.parse(text) : null };
+  }
+
   async function signIn(user) {
     const { body } = await api('/auth/v1/token?grant_type=password', {
       method: 'POST',
@@ -1325,7 +1540,7 @@ describe('through the stand-in, the way a device and the website do it', () => {
   }
 
   before(async () => {
-    standIn = await startStandIn({ port: 0, log: () => {} });
+    standIn = await startStandIn({ port: 0, log: () => {}, sensorData: false });
     tokens.officer = await signIn(officerLogin);
     tokens.admin = await signIn(adminLogin);
     tokens.botanist = await signIn(botanistLogin);
@@ -1334,30 +1549,22 @@ describe('through the stand-in, the way a device and the website do it', () => {
 
   after(() => standIn.close());
 
-  function addReadings(device, token, readings) {
-    return api('/rest/v1/rpc/iot_add_readings', {
-      method: 'POST',
-      body: { device, token, readings },
-    });
-  }
-
-  test('an admin adds a device, links a node and makes a token', async () => {
+  test('an admin adds a device with its position, links a node and makes a token', async () => {
     const added = await api('/rest/v1/iot_devices', {
       method: 'POST',
       token: tokens.admin,
       headers: representation,
-      body: { device_id: 'HTTP-REGION', name: 'HTTP region' },
+      body: { device_id: 'HTTP-REGION', name: 'HTTP region', latitude: 3.8149, longitude: 113.7797 },
     });
     assert.equal(added.status, 201);
 
-    const linked = await api('/rest/v1/iot_nodes?node_id=eq.NNP-IOT-01', {
+    const linked = await api('/rest/v1/iot_nodes?node_id=eq.NNP-IOT-01&select=node_id', {
       method: 'PATCH',
       token: tokens.admin,
       headers: representation,
       body: { edge_device_id: 'HTTP-REGION' },
     });
-    assert.equal(linked.status, 200);
-    assert.equal(linked.body.length, 1);
+    assert.deepEqual([linked.status, linked.body], [200, [{ node_id: 'NNP-IOT-01' }]]);
 
     const made = await api('/rest/v1/rpc/iot_make_device_token', {
       method: 'POST',
@@ -1376,255 +1583,153 @@ describe('through the stand-in, the way a device and the website do it', () => {
     assert.equal(officerTry.status, 403);
   });
 
-  test('the publishable key adds readings with the token, and nothing without it', async () => {
-    const sent = {
-      reading_id: 'http-1',
-      node_id: 'NNP-IOT-01',
-      recorded_at: new Date().toISOString(),
-      ...calm,
-      tilt_degrees: 80,
+  test('an edge uploads with its token and no anon key, and nothing goes in without it', async () => {
+    const now = nowSeconds();
+    const batch = {
+      edge_id: 'HTTP-REGION',
+      nodes: [{ node_id: 'NNP-IOT-01', boot_id: 5, rows: [[1, now - 20, 1, 26, 80, 2600, 4095, 131, 120, 0, -61, 0]] }],
+      boots: [{ node_id: 'NNP-IOT-01', boot_id: 5, lat: 3.8155, lon: 113.779, at: new Date().toISOString() }],
     };
-    const first = await addReadings('HTTP-REGION', deviceToken, [sent]);
+    const first = await edgeUpload(deviceToken, batch);
     assert.equal(first.status, 200);
-    assert.deepEqual(first.body, { accepted: 1, duplicates: 0, refused: [] });
+    assert.deepEqual(first.body.calibration.map((c) => c.node_id), ['NNP-IOT-01']);
 
-    const again = await addReadings('HTTP-REGION', deviceToken, [sent]);
-    assert.deepEqual(again.body, { accepted: 0, duplicates: 1, refused: [] });
-
-    const wrong = await addReadings('HTTP-REGION', 'wrong', [sent]);
-    assert.equal(wrong.status, 401);
-    const unknown = await addReadings('NO-SUCH-DEVICE', deviceToken, [sent]);
-    assert.equal(unknown.status, 401);
-    assert.equal(unknown.body.message, wrong.body.message);
-
-    const tooMany = await addReadings('HTTP-REGION', deviceToken, Array(101).fill(sent));
-    assert.equal(tooMany.status, 400);
+    const wrong = await edgeUpload('wrong-but-long-enough', batch);
+    assert.deepEqual(wrong, notThisDevice);
+    const unknown = await edgeUpload(deviceToken, { ...batch, edge_id: 'NO-SUCH-DEVICE' });
+    assert.deepEqual(unknown, notThisDevice);
+    const { rows } = await standIn.db.query("SELECT count(*)::int AS n FROM public.iot_readings WHERE node_id = 'NNP-IOT-01'");
+    assert.equal(rows[0].n, 1);
   });
 
-  test('the publishable key reads nothing back', async () => {
-    for (const table of ['iot_readings', 'iot_alerts', 'iot_devices', 'iot_device_tokens', 'iot_node_status']) {
+  test('the anon key reads nothing back', async () => {
+    for (const table of ['iot_readings', 'iot_alerts', 'iot_boots', 'iot_commands', 'iot_devices', 'iot_device_tokens', 'iot_node_status']) {
       const { status } = await api(`/rest/v1/${table}?select=*`);
       assert.equal(status, 401, table);
     }
   });
 
-  test('officers read readings and alerts, and a botanist or visitor gets nothing', async () => {
-    for (const path of ['iot_readings?node_id=eq.NNP-IOT-01', 'iot_alerts?node_id=eq.NNP-IOT-01']) {
+  test('officers read what the Sensors page reads, and a botanist or visitor gets nothing', async () => {
+    // The same reads as the Sensors page, as supabase-js sends them
+    const paths = [
+      'iot_node_status?select=node_id,dist_state,open_alerts',
+      'iot_alerts?select=id,type,status&status=neq.resolved',
+      'iot_readings?select=recorded_at,dist_cm&node_id=eq.NNP-IOT-01&order=recorded_at.desc&limit=180',
+      'iot_boots?select=node_id,latitude,longitude,position_at&latitude=not.is.null&order=position_at.desc.nullslast&limit=500',
+      'iot_devices?select=device_id,latitude,longitude&order=device_id',
+    ];
+    for (const path of paths) {
       const staff = await api(`/rest/v1/${path}`, { token: tokens.officer });
-      assert.equal(staff.status, 200);
-      assert.equal(staff.body.length, 1, path);
+      assert.equal(staff.status, 200, path);
+      assert.ok(staff.body.length > 0, path);
       for (const token of [tokens.botanist, tokens.visitor]) {
-        const refused = await api(`/rest/v1/${path}`, { token });
-        assert.deepEqual(refused.body, [], path);
+        assert.deepEqual((await api(`/rest/v1/${path}`, { token })).body, [], path);
       }
     }
-    const status = await api('/rest/v1/iot_node_status?node_id=eq.NNP-IOT-01', {
+    const { body } = await api('/rest/v1/iot_node_status?select=dist_state,open_alerts&node_id=eq.NNP-IOT-01', {
       token: tokens.officer,
     });
-    assert.equal(Number(status.body[0].tilt_degrees), 80);
+    assert.deepEqual(body, [{ dist_state: 'MOVED', open_alerts: 1 }]);
   });
 
   test('an officer acknowledges and resolves through the API, and a botanist cannot', async () => {
-    const counts = await api('/rest/v1/rpc/iot_check_alerts', {
-      method: 'POST',
-      token: tokens.officer,
-      body: {},
-    });
+    const counts = await api('/rest/v1/rpc/iot_check_alerts', { method: 'POST', token: tokens.officer, body: {} });
     assert.deepEqual(counts.body, { urgent: 1, open: 1 });
 
-    const list = await api('/rest/v1/iot_alerts?status=eq.open', { token: tokens.officer });
+    const list = await api('/rest/v1/iot_alerts?status=eq.open&select=id', { token: tokens.officer });
     const alert = list.body[0].id;
 
-    const refused = await api('/rest/v1/rpc/iot_acknowledge_alert', {
-      method: 'POST',
-      token: tokens.botanist,
-      body: { alert },
-    });
+    const refused = await api('/rest/v1/rpc/iot_acknowledge_alert', { method: 'POST', token: tokens.botanist, body: { alert } });
     assert.equal(refused.status, 403);
-    const noCount = await api('/rest/v1/rpc/iot_check_alerts', {
-      method: 'POST',
-      token: tokens.visitor,
-      body: {},
-    });
+    const noCount = await api('/rest/v1/rpc/iot_check_alerts', { method: 'POST', token: tokens.visitor, body: {} });
     assert.equal(noCount.status, 403);
 
-    const seen = await api('/rest/v1/rpc/iot_acknowledge_alert', {
-      method: 'POST',
-      token: tokens.officer,
-      body: { alert },
-    });
+    const seen = await api('/rest/v1/rpc/iot_acknowledge_alert', { method: 'POST', token: tokens.officer, body: { alert } });
     assert.deepEqual(seen.body, { id: alert, status: 'acknowledged' });
-    const done = await api('/rest/v1/rpc/iot_resolve_alert', {
-      method: 'POST',
-      token: tokens.officer,
-      body: { alert },
-    });
+    const done = await api('/rest/v1/rpc/iot_resolve_alert', { method: 'POST', token: tokens.officer, body: { alert } });
     assert.deepEqual(done.body, { id: alert, status: 'resolved' });
 
-    const after = await api(`/rest/v1/iot_alerts?id=eq.${alert}`, { token: tokens.officer });
-    assert.equal(after.body[0].acknowledged_by_name, officerLogin.name);
-    assert.equal(after.body[0].resolved_by_name, officerLogin.name);
+    const after = await api(`/rest/v1/iot_alerts?id=eq.${alert}&select=acknowledged_by_name,resolved_by_name`, { token: tokens.officer });
+    assert.deepEqual(after.body, [{ acknowledged_by_name: officerLogin.name, resolved_by_name: officerLogin.name }]);
   });
-});
 
-describe('the node simulator', () => {
-  const SIMULATOR = fileURLToPath(new URL('../../iot/node-simulator/node-simulator.mjs', import.meta.url));
-  const [officerLogin] = TEST_USERS;
-  let standIn;
-  let officerToken;
-
-  /** Runs the simulator on its own, the way someone would from a terminal. */
-  function simulate(args, env = {}) {
-    return new Promise((resolve) => {
-      execFile(
-        process.execPath,
-        [SIMULATOR, ...args],
-        { env: { PATH: process.env.PATH, IOT_SUPABASE_URL: standIn.url, ...env }, timeout: 20000 },
-        (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr }),
-      );
-    });
-  }
-
-  async function officerGets(path) {
-    const response = await fetch(`${standIn.url}/rest/v1/${path}`, {
-      headers: { apikey: ANON_KEY, Authorization: `Bearer ${officerToken}` },
-    });
-    return response.json();
-  }
-
-  async function openAlerts(kind) {
-    return officerGets(`iot_alerts?node_id=eq.NNP-IOT-01&kind=eq.${kind}&status=eq.open`);
-  }
-
-  before(async () => {
-    standIn = await startStandIn({ port: 0, log: () => {} });
-    const response = await fetch(`${standIn.url}/auth/v1/token?grant_type=password`, {
+  test('an officer sends a command from the website, and the edge gets it with its next upload', async () => {
+    const sent = await api('/rest/v1/iot_commands', {
       method: 'POST',
-      headers: { apikey: ANON_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: officerLogin.email, password: TEST_PASSWORD }),
+      token: tokens.officer,
+      body: { node_id: 'NNP-IOT-01', command: 'beep_on' },
     });
-    officerToken = (await response.json()).access_token;
+    assert.equal(sent.status, 201);
+    const botanistTry = await api('/rest/v1/iot_commands', {
+      method: 'POST',
+      token: tokens.botanist,
+      body: { node_id: 'NNP-IOT-01', command: 'beep_on' },
+    });
+    assert.equal(botanistTry.status, 403);
+
+    const answer = await edgeUpload(deviceToken, { edge_id: 'HTTP-REGION', cal_since: Number.MAX_SAFE_INTEGER });
+    assert.deepEqual(
+      answer.body.commands.map((c) => [c.node_id, c.command]),
+      [['NNP-IOT-01', 'beep_on']],
+    );
+    const { body } = await api('/rest/v1/iot_commands?select=status,created_by_name', { token: tokens.officer });
+    assert.deepEqual(body, [{ status: 'pending', created_by_name: officerLogin.name }]);
   });
 
-  after(() => standIn.close());
-
-  test('a calm round adds a reading from each node and raises nothing', async () => {
-    const { code, stdout } = await simulate(['--scenario', 'normal']);
-    assert.equal(code, 0);
-    assert.match(stdout, /added 3, already there 0, turned down 0/);
-    assert.match(stdout, /made up/);
-
-    const alerts = await officerGets('iot_alerts?select=id');
-    assert.deepEqual(alerts, []);
-    const stored = await officerGets('iot_readings?select=node_id');
-    assert.equal(stored.length, 3);
-  });
-
-  test('a disturbance raises an urgent alert on the first node only', async () => {
-    const { code } = await simulate(['--scenario', 'disturbance']);
-    assert.equal(code, 0);
-
-    const alerts = await openAlerts('disturbance');
-    assert.equal(alerts.length, 1);
-    assert.equal(alerts[0].severity, 'urgent');
-    const others = await officerGets('iot_alerts?node_id=neq.NNP-IOT-01&select=id');
-    assert.deepEqual(others, []);
-  });
-
-  test('sending the same readings again only counts as already there', async () => {
-    const { code, stdout } = await simulate(['--scenario', 'resend']);
-    assert.equal(code, 0);
-    assert.match(stdout, /added 3, already there 0, turned down 0/);
-    assert.match(stdout, /added 0, already there 3, turned down 0/);
-  });
-
-  test('a value no sensor could read is turned down, and says why', async () => {
-    const { code, stdout } = await simulate(['--scenario', 'bad-value']);
-    assert.equal(code, 0);
-    assert.match(stdout, /added 2, already there 0, turned down 1/);
-    assert.match(stdout, /humidity_percent_in_range/);
-  });
-
-  test('a node that stops sending gets a quiet alert from the next check', async () => {
-    // A backdated reading is the only way to the first node having gone quiet without waiting 15
-    // minutes. It has its own stand-in, because the other tests here just heard from that node.
-    const fresh = await startStandIn({ port: 0, log: () => {} });
-    try {
-      const { code } = await simulate(['--scenario', 'quiet'], { IOT_SUPABASE_URL: fresh.url });
-      assert.equal(code, 0);
-
-      const login = await fetch(`${fresh.url}/auth/v1/token?grant_type=password`, {
-        method: 'POST',
-        headers: { apikey: ANON_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: officerLogin.email, password: TEST_PASSWORD }),
-      });
-      const { access_token: token } = await login.json();
-      const headers = {
-        apikey: ANON_KEY,
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      };
-
-      const check = await fetch(`${fresh.url}/rest/v1/rpc/iot_check_alerts`, {
-        method: 'POST',
-        headers,
-        body: '{}',
-      });
-      assert.equal(check.status, 200);
-
-      const alerts = await fetch(`${fresh.url}/rest/v1/iot_alerts?kind=eq.quiet`, { headers });
-      const quiet = await alerts.json();
-      assert.deepEqual(quiet.map((alert) => alert.node_id), ['NNP-IOT-01']);
-    } finally {
-      await fresh.close();
-    }
-  });
-
-  test('it stops at a wrong token and says so', async () => {
-    const { code, stderr } = await simulate(['--scenario', 'normal'], { IOT_DEVICE_TOKEN: 'not-the-token' });
-    assert.equal(code, 1);
-    assert.match(stderr, /turned this device down/);
-  });
-
-  test('it stops at a database without the IoT SQL and says what to run', async () => {
+  test('without the sensor files there is no edge-com, like a project where it isn’t deployed', async () => {
     const older = await startStandIn({ port: 0, log: () => {}, sqlThrough: '015' });
     try {
-      const { code, stderr } = await simulate(['--scenario', 'normal'], { IOT_SUPABASE_URL: older.url });
-      assert.equal(code, 1);
-      assert.match(stderr, /016_iot_readings\.sql/);
-
-      const table = await fetch(`${older.url}/rest/v1/iot_readings`, { headers: { apikey: ANON_KEY } });
-      assert.equal(table.status, 404);
-      assert.equal((await table.json()).code, 'PGRST205');
+      assert.equal(older.edgeCom, false);
+      const response = await fetch(`${older.url}/functions/v1/edge-com`, { method: 'POST', body: '{}' });
+      assert.equal(response.status, 404);
     } finally {
       await older.close();
     }
   });
+});
 
-  test('it refuses anything that is not this computer unless told, and always refuses plain http', async () => {
-    // A closed port on a made up test host, so nothing can answer even if the check failed
-    const host = { IOT_SUPABASE_URL: 'https://niah-simulator-test.example.test' };
-    const refused = await simulate(['--scenario', 'normal'], host);
-    assert.equal(refused.code, 1);
-    assert.match(refused.stderr, /isn't this computer/);
-    assert.doesNotMatch(refused.stdout, /Sending to/);
+describe('the stand-in’s made-up sensor data', () => {
+  let standIn;
 
-    const noSettings = await simulate(['--scenario', 'normal', '--allow-remote'], host);
-    assert.equal(noSettings.code, 1);
-    assert.match(noSettings.stderr, /The defaults only work on the stand-in/);
-    assert.doesNotMatch(noSettings.stdout, /Sending to/);
-
-    const plainHttp = await simulate(['--scenario', 'normal', '--allow-remote'], {
-      IOT_SUPABASE_URL: 'http://niah-simulator-test.example.test',
-    });
-    assert.equal(plainHttp.code, 1);
-    assert.match(plainHttp.stderr, /has to use https/);
-    assert.doesNotMatch(plainHttp.stdout, /Sending to/);
+  before(async () => {
+    standIn = await startStandIn({ port: 0, log: () => {} });
   });
 
-  test('it turns down a scenario it does not know', async () => {
-    const { code, stderr } = await simulate(['--scenario', 'made-up']);
-    assert.equal(code, 1);
-    assert.match(stderr, /no scenario called made-up/);
+  after(() => standIn.close());
+
+  test('a day of readings from three nodes, with a position each, on the test device', async () => {
+    const { rows } = await standIn.db.query(
+      `SELECT r.node_id, count(*)::int AS n, b.latitude IS NOT NULL AS placed
+       FROM public.iot_readings AS r JOIN public.iot_boots AS b USING (node_id, boot_id)
+       WHERE r.device_id = $1 GROUP BY r.node_id, b.latitude ORDER BY r.node_id`,
+      [TEST_DEVICE_ID],
+    );
+    assert.equal(rows.length, 3);
+    for (const row of rows) {
+      assert.ok(row.n > 100, row.node_id);
+      assert.equal(row.placed, true, row.node_id);
+    }
+  });
+
+  test('one node of each kind for the Sensors page: urgent, routine and quiet', async () => {
+    const { rows: nodes } = await standIn.db.query(
+      'SELECT status FROM public.iot_nodes WHERE edge_device_id = $1 ORDER BY node_id LIMIT 3',
+      [TEST_DEVICE_ID],
+    );
+    assert.deepEqual(nodes.map((n) => n.status), ['threat_triggered', 'warning', 'offline']);
+    const { rows: alerts } = await standIn.db.query(
+      'SELECT type, from_backlog, cleared_at IS NOT NULL AS ended FROM public.iot_alerts ORDER BY id',
+    );
+    assert.deepEqual(alerts, [
+      { type: 'SATURATED', from_backlog: false, ended: false },
+      { type: 'MOVED', from_backlog: false, ended: true },
+      { type: 'RAIN', from_backlog: false, ended: false },
+      { type: 'QUIET', from_backlog: false, ended: false },
+    ]);
+    const { rows: commands } = await standIn.db.query('SELECT command, status FROM public.iot_commands ORDER BY created_at');
+    assert.deepEqual(commands, [
+      { command: 'beep_on', status: 'done' },
+      { command: 'beep_off', status: 'done' },
+    ]);
   });
 });

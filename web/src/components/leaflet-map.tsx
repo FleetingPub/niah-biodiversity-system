@@ -9,6 +9,7 @@ import type {
 } from "leaflet";
 import { useEffect, useRef, useState } from "react";
 import { PARK_HQ, type Area } from "@/lib/geo";
+import { SENSOR_CLASS, type SensorMapState } from "@/lib/iot";
 
 export type MapPoint = {
   id: string;
@@ -19,12 +20,21 @@ export type MapPoint = {
   link?: { href: string; text: string };
 };
 export type MapArea = Area & { id: string };
+// The same four looks as the map on the Sensors page. mapStateOf in lib/iot.ts works it out from
+// a row of iot_node_status.
 export type MapSensor = {
   id: string;
   lat: number;
   lng: number;
-  online: boolean;
-  alert: boolean;
+  state: SensorMapState;
+};
+
+// Said in words, since a screen reader can't see a sensor is amber, hollow or circled
+const SENSOR_WORDS: Record<SensorMapState, string> = {
+  ok: "reporting",
+  warning: "with a routine alert",
+  alert: "with an urgent alert",
+  quiet: "gone quiet",
 };
 
 // The same colour as globals.css. Leaflet writes it onto the SVG as an
@@ -314,11 +324,7 @@ export function LeafletMap({
           const marker = L.marker(at, {
             icon: L.divIcon({
               html: square,
-              className: [
-                "map-sensor",
-                sensor.online ? "" : "map-sensor-offline",
-                sensor.alert ? "map-sensor-alert" : "",
-              ].join(" "),
+              className: SENSOR_CLASS[sensor.state],
               iconSize: [14, 14],
             }),
             interactive: false,
@@ -334,14 +340,7 @@ export function LeafletMap({
             })
             .addTo(map);
           remember(2, marker);
-          // Said in words, since a screen reader can't see it's hollow or
-          // circled
-          const name = [
-            `Sensor ${sensor.id}`,
-            sensor.online ? "online" : "offline",
-            ...(sensor.alert ? ["with an alert"] : []),
-          ].join(", ");
-          showsItsName(square, name, marker, at);
+          showsItsName(square, `Sensor ${sensor.id}, ${SENSOR_WORDS[sensor.state]}`, marker, at);
         }
         // Leaflet doesn't count a drag as a click, so moving the map keeps a
         // tapped sensor's name showing

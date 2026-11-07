@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import { PARK_HQ } from "@/lib/geo";
+import { SENSOR_CLASS } from "@/lib/iot";
 import type { MapArea, MapPoint, MapSensor } from "./leaflet-map";
 
 // The map for browsers with JavaScript turned off (ParkMap puts it in a
@@ -290,11 +291,7 @@ export function StaticMap({
           {sensorSpots.map((sensor) => (
             <div key={sensor.id}>
               <span
-                className={[
-                  "map-sensor absolute size-3.5 -translate-x-1/2 -translate-y-1/2",
-                  sensor.online ? "" : "map-sensor-offline",
-                  sensor.alert ? "map-sensor-alert" : "",
-                ].join(" ")}
+                className={`${SENSOR_CLASS[sensor.state]} absolute size-3.5 -translate-x-1/2 -translate-y-1/2`}
                 style={place(sensor.x, sensor.y)}
               >
                 <span />

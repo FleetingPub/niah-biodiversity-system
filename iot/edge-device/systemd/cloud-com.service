@@ -1,0 +1,17 @@
+[Unit]
+Description=Field node cloud-com (SQLite -> Supabase edge-com, commands back)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iotedge
+Group=iotedge
+WorkingDirectory=/opt/iot-edge
+ExecStart=/opt/iot-edge/venv/bin/python /opt/iot-edge/cloud-com.py --config /opt/iot-edge/config.toml
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

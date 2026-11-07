@@ -25,12 +25,18 @@ export const SQL_FILES = [
   '013_edit_history.sql',
   '014_photo_folder.sql',
   '015_species_rough_area.sql',
-  '016_iot_readings.sql',
+  '016_1_iot_devices.sql',
+  '016_2_iot_nodes.sql',
+  '016_3_iot_device_tokens.sql',
+  '016_4_iot_readings.sql',
   '017_iot_alerts.sql',
   '019_public_record_details.sql',
   '020_record_photo_access.sql',
   '021_role_changes.sql',
   '022_iot_reading_limit.sql',
+  '023_iot_boots.sql',
+  '024_iot_alert_state.sql',
+  '025_iot_commands.sql',
 ];
 
 export function readSql(file) {

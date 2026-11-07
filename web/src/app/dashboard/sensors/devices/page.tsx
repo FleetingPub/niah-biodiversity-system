@@ -7,6 +7,7 @@ import { clockNow, formatDate, parkTime } from "@/lib/format";
 import { ageInWords } from "@/lib/iot";
 import { sqlIsMissing } from "@/lib/iot-db";
 import { createClient } from "@/lib/supabase/server";
+import { DevicePositions, type DevicePlace } from "./device-positions";
 import { Devices, type DeviceItem, type NodeItem } from "./devices";
 
 export const metadata: Metadata = { title: "Sensor devices" };
@@ -50,7 +51,7 @@ export default async function DevicesPage() {
     <PageHeader
       eyebrow="Monitoring"
       title="Sensor devices"
-      description="There’s one edge device for each forest region, and each sends for the nodes linked to it. A device’s token lets it add readings for those nodes and nothing else. iot/README.md says how to set one up."
+      description="There’s one edge device for each forest region, and each sends for the nodes linked to it. A device’s token lets it add readings for those nodes and nothing else, and readings from a node that isn’t linked are turned down. iot/README.md says how to set one up."
       aside={BACK}
     />
   );
@@ -60,9 +61,9 @@ export default async function DevicesPage() {
   const [devicesResult, nodesResult] = await Promise.all([
     supabase
       .from("iot_devices")
-      .select("device_id, name, zone, enabled, token_made_at, token_made_by_name, last_heard_at")
+      .select("device_id, name, zone, enabled, token_made_at, token_made_by_name, last_heard_at, latitude, longitude")
       .order("device_id"),
-    // Only these columns. iot_nodes also has old columns that 002 filled with made up numbers.
+    // Only these columns. iot_nodes also has each node's calibration, which isn't changed here.
     supabase.from("iot_nodes").select("node_id, name, zone, edge_device_id").order("node_id"),
   ]);
 
@@ -71,8 +72,9 @@ export default async function DevicesPage() {
       <div className="space-y-12">
         {header}
         <Problem>
-          This database hasn’t been set up for sensors yet, so there aren’t any devices to manage. Run
-          the sensor steps in supabase/README.md first.
+          This database hasn’t been set up for sensors yet, or has an older version of the sensor
+          tables, so there aren’t any devices to manage. Run the sensor files, 016_1 to 025, in
+          supabase/README.md first.
         </Problem>
       </div>
     );
@@ -108,6 +110,12 @@ export default async function DevicesPage() {
       ? `Last heard from ${ageInWords(row.last_heard_at, now)}`
       : "Not heard from yet",
   }));
+  const places: DevicePlace[] = devicesResult.data.map((row) => ({
+    id: row.device_id,
+    name: row.name,
+    latitude: row.latitude === null ? "" : String(row.latitude),
+    longitude: row.longitude === null ? "" : String(row.longitude),
+  }));
   const nodes: NodeItem[] = nodesResult.data.map((row) => ({
     id: row.node_id,
     name: row.name,
@@ -119,6 +127,7 @@ export default async function DevicesPage() {
     <div className="space-y-12">
       {header}
       <Devices devices={devices} nodes={nodes} />
+      <DevicePositions devices={places} />
     </div>
   );
 }
