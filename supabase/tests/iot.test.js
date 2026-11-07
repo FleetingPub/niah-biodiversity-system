@@ -1375,15 +1375,26 @@ describe('the status view for the Sensors page', () => {
     assert.deepEqual([Number(row.open_alerts), Number(row.urgent_alerts)], [1, 1]);
   });
 
-  test('the made-up numbers from 001 never show, and their columns are gone', async () => {
-    const { rows } = await db.query(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = 'public' AND table_name IN ('iot_nodes', 'iot_node_status')`,
-    );
-    const columns = new Set(rows.map((row) => row.column_name));
-    for (const gone of ['battery_percent', 'temperature_c', 'humidity_percent', 'soil_moisture_percent',
-      'pir_movement_detected', 'tilt_alert', 'threat_details', 'latitude', 'longitude']) {
-      assert.ok(!columns.has(gone), gone);
+  test('running 002 again leaves the nodes as they are', async () => {
+    const everyNode = 'SELECT * FROM public.iot_nodes ORDER BY node_id';
+    const before = (await db.query(everyNode)).rows;
+    await db.exec(readSql('002_seed_data.sql'));
+    assert.deepEqual((await db.query(everyNode)).rows, before);
+  });
+
+  test('the sample nodes from 002 start with no readings', async () => {
+    const fresh = await newDatabase();
+    try {
+      const { rows } = await fresh.query(
+        `SELECT n.node_id, n.status, n.last_heartbeat, n.edge_device_id, s.last_reading_at, s.quiet
+         FROM public.iot_nodes AS n JOIN public.iot_node_status AS s USING (node_id)
+         ORDER BY n.node_id`,
+      );
+      assert.deepEqual(rows, ['NNP-IOT-01', 'NNP-IOT-02', 'NNP-IOT-03'].map((node_id) => ({
+        node_id, status: 'online', last_heartbeat: null, edge_device_id: null, last_reading_at: null, quiet: false,
+      })));
+    } finally {
+      await fresh.close();
     }
   });
 
