@@ -119,21 +119,16 @@ SELECT
 FROM public.records;
 
 -- ------------------------------------------------------------------------------
--- 4. IoT Sensor Nodes & Telemetry Table
+-- 4. IoT Sensor Nodes Table
+-- The field nodes themselves. Their readings are in iot_readings (016_4), and 016_2 adds each
+-- node's edge device, calibration and alert settings.
 -- ------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.iot_nodes (
     node_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     zone TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'online' CHECK (status IN ('online', 'warning', 'threat_triggered', 'offline')),
-    battery_percent INTEGER DEFAULT 100,
-    last_heartbeat TIMESTAMPTZ DEFAULT NOW(),
-    temperature_c NUMERIC(5, 2),
-    humidity_percent NUMERIC(5, 2),
-    soil_moisture_percent NUMERIC(5, 2),
-    pir_movement_detected BOOLEAN DEFAULT FALSE,
-    tilt_alert BOOLEAN DEFAULT FALSE,
-    threat_details TEXT
+    last_heartbeat TIMESTAMPTZ                 -- the time of the node's newest reading; empty until it sends one
 );
 
 -- ------------------------------------------------------------------------------
