@@ -1109,10 +1109,12 @@ describe('running 006, 007 and 008 again', () => {
   test('ends up the same as the first time', async () => {
     const firstTime = await catalogs();
     // 006 makes records_public, species_staff and records_staff again without what 007, 008 and
-    // 019 add to them, so they have to run again after it (see supabase/README.md).
+    // 019 add to them, and its REVOKE on iot_nodes takes the column grants 016_2 adds, so they
+    // have to run again after it (see supabase/README.md).
     await db.exec(readSql('006_role_based_access.sql'));
     await db.exec(readSql('007_species_fixes.sql'));
     await db.exec(readSql('008_record_edits.sql'));
+    await db.exec(readSql('016_2_iot_nodes.sql'));
     await db.exec(readSql('019_public_record_details.sql'));
     assert.deepEqual(await catalogs(), firstTime);
 
@@ -1138,6 +1140,7 @@ describe('running 006, 007 and 008 again', () => {
     } finally {
       await db.exec(readSql('007_species_fixes.sql'));
       await db.exec(readSql('008_record_edits.sql'));
+      await db.exec(readSql('016_2_iot_nodes.sql'));
       await db.exec(readSql('019_public_record_details.sql'));
     }
   });
