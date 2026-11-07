@@ -267,11 +267,14 @@ ON CONFLICT (id) DO NOTHING;
 
 -- ------------------------------------------------------------------------------
 -- 3. Seed IoT Sensor Nodes
+-- Three sample field nodes, named and placed by zone only. They have no readings: those come from
+-- an edge device through edge-com (016_1 to 025), which also sets status and last_heartbeat from
+-- them. An admin links each node to its edge device on the Devices page. Only columns that are
+-- there before and after 016_2 are written, so this file still runs after every other file, and it
+-- leaves nodes that are already there as they are.
 -- ------------------------------------------------------------------------------
-INSERT INTO public.iot_nodes (
-    node_id, name, zone, status, battery_percent, temperature_c, humidity_percent, soil_moisture_percent, pir_movement_detected, tilt_alert
-) VALUES
-('NNP-IOT-01', 'Boardwalk West Sensor Node', 'Pangkalan Lubang Boardwalk', 'online', 94, 27.8, 86.4, 62.1, FALSE, FALSE),
-('NNP-IOT-02', 'Great Cave Trail Sensor Node', 'Great Cave Path (Gully 3)', 'online', 88, 26.2, 91.5, 74.0, FALSE, FALSE),
-('NNP-IOT-03', 'Bukit Kasut Ridge Node', 'Bukit Kasut Limestone Ridge', 'warning', 45, 30.1, 79.2, 38.5, FALSE, FALSE)
+INSERT INTO public.iot_nodes (node_id, name, zone, status, last_heartbeat) VALUES
+('NNP-IOT-01', 'Boardwalk West Sensor Node', 'Pangkalan Lubang Boardwalk', 'online', NULL),
+('NNP-IOT-02', 'Great Cave Trail Sensor Node', 'Great Cave Path (Gully 3)', 'online', NULL),
+('NNP-IOT-03', 'Bukit Kasut Ridge Node', 'Bukit Kasut Limestone Ridge', 'online', NULL)
 ON CONFLICT (node_id) DO NOTHING;
