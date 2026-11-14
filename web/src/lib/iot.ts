@@ -141,6 +141,20 @@ export type EdgeDevice = {
 
 export type NodePosition = { nodeId: string; latitude: number; longitude: number; positionAt: string | null };
 
+/** The lowest, average and highest of one value over a day. Each is null if no reading that day had it. */
+export type DayRange = { min: number | null; avg: number | null; max: number | null };
+
+/** One node's day in figures, from iot_daily_summary (026): today and the 6 days before, park time. */
+export type DailySummary = {
+  nodeId: string;
+  /** The park date, like 2026-11-14 */
+  day: string;
+  readings: number;
+  temp: DayRange;
+  hum: DayRange;
+  soil: DayRange;
+};
+
 // The columns the pages read. None of them gets a select("*"), so a column added later for staff
 // only can't leak into a page by accident.
 export const NODE_COLUMNS =
@@ -153,6 +167,8 @@ export const HISTORY_COLUMNS = "recorded_at, temp_c, hum_pct, soil_raw, rain_raw
 export const COMMAND_COLUMNS = "id, node_id, command, status, created_at, created_by_name, done_at, result";
 export const DEVICE_COLUMNS = "device_id, name, zone, enabled, last_heard_at, latitude, longitude";
 export const POSITION_COLUMNS = "node_id, latitude, longitude, position_at";
+export const DAILY_COLUMNS =
+  "node_id, day, readings, temp_min, temp_avg, temp_max, hum_min, hum_avg, hum_max, soil_min, soil_avg, soil_max";
 
 type Row = Record<string, unknown>;
 
@@ -245,6 +261,23 @@ export function settingsFromRow(row: Row): NodeSettings {
     motionClearReadings: n("motion_clear_readings"),
     alertRearmS: n("alert_rearm_s"),
     quietMinutes: n("quiet_minutes"),
+  };
+}
+
+export function dailyFromRow(row: Row): DailySummary {
+  const range = (name: string): DayRange => ({
+    min: numberOrNull(row[`${name}_min`]),
+    avg: numberOrNull(row[`${name}_avg`]),
+    max: numberOrNull(row[`${name}_max`]),
+  });
+  return {
+    nodeId: String(row.node_id),
+    // A date column comes as 2026-11-14, but keep only the date in case a time comes with it
+    day: String(row.day).slice(0, 10),
+    readings: Number(row.readings ?? 0),
+    temp: range("temp"),
+    hum: range("hum"),
+    soil: range("soil"),
   };
 }
 
