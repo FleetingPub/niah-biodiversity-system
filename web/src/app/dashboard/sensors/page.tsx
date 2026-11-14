@@ -11,6 +11,7 @@ import {
   COMMAND_COLUMNS,
   COMMAND_STATUS_WORDS,
   COMMAND_WORDS,
+  DAILY_COLUMNS,
   DEVICE_COLUMNS,
   HISTORY_COLUMNS,
   NODE_COLUMNS,
@@ -21,6 +22,7 @@ import {
   alertFromRow,
   alertOrder,
   commandFromRow,
+  dailyFromRow,
   deviceFromRow,
   durationInWords,
   historyFromRow,
@@ -32,6 +34,8 @@ import {
   settingsFromRow,
   shortNumber,
   type CommandName,
+  type DailySummary,
+  type DayRange,
   type EdgeDevice,
   type HistoryReading,
   type NodePosition,
@@ -253,10 +257,159 @@ function SettingsList({ settings }: { settings: NodeSettings }) {
   );
 }
 
+const DAY_MEASURES = [
+  { key: "temp", short: "Temp.", label: "Temperature", unit: " °C", headUnit: "°C" },
+  { key: "hum", short: "Humidity", label: "Humidity", unit: "%", headUnit: "%" },
+  { key: "soil", short: "Soil", label: "Soil moisture", unit: "%", headUnit: "%" },
+] as const;
+type DayMeasure = (typeof DAY_MEASURES)[number];
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** The short label on screen, and the full one for a screen reader */
+function MeasureName({ measure }: { measure: DayMeasure }) {
+  if (measure.short === measure.label) return <>{measure.label}</>;
+  return (
+    <>
+      <span aria-hidden="true">{measure.short}</span>
+      <span className="sr-only">{measure.label}</span>
+    </>
+  );
+}
+
+function figure(value: number | null, unit = "") {
+  return value === null ? "None sent" : `${shortNumber(value)}${unit}`;
+}
+
+/** "24–28.7" on screen, "24 to 28.7" for a screen reader */
+function RangeText({ range }: { range: DayRange }) {
+  if (range.min === null || range.max === null) return <>None sent</>;
+  const low = shortNumber(range.min);
+  const high = shortNumber(range.max);
+  return (
+    <>
+      <span aria-hidden="true">
+        {low}–{high}
+      </span>
+      <span className="sr-only">
+        {low} to {high}
+      </span>
+    </>
+  );
+}
+
+/** "Today", "Yesterday" or "Wed 11 Nov", for a park date like 2026-11-11 */
+function dayLabel(day: string, today: string) {
+  const [year, month, date] = day.split("-").map(Number);
+  const ms = Date.UTC(year, month - 1, date);
+  const daysAgo = Math.round((Date.parse(`${today}T00:00:00Z`) - ms) / 86400000);
+  if (daysAgo === 0) return "Today";
+  if (daysAgo === 1) return "Yesterday";
+  return `${WEEKDAYS[new Date(ms).getUTCDay()]} ${date} ${MONTHS[month - 1]}`;
+}
+
+const DAY_CELL = "whitespace-nowrap px-2 py-2";
+
+/** Today's lowest, average and highest, and the same for each of the last 7 days (026) */
+function DailyFigures({ nodeId, days, today }: { nodeId: string; days: DailySummary[] | null; today: string }) {
+  if (days === null) {
+    return (
+      <p className="mt-4 flex items-start gap-1.5 border-t border-line pt-4 text-sm font-bold text-bad">
+        <Icon name="alert" className="mt-0.5 size-4 shrink-0" />
+        Today’s lowest, average and highest didn’t load. This page tries again by itself.
+      </p>
+    );
+  }
+  const todays = days.find((day) => day.day === today);
+  const headingId = `${nodeId}-today`;
+  return (
+    <div className="mt-4 border-t border-line pt-4 text-sm">
+      <h4 id={headingId} className="font-bold">
+        Today so far
+      </h4>
+      {todays ? (
+        <>
+          <p className="text-moss">From {plural(todays.readings, "reading")} since midnight.</p>
+          <div className="relative mt-2 overflow-x-auto rounded-lg border border-line">
+            <table className="w-full text-left" aria-labelledby={headingId}>
+              <thead className="border-b border-line bg-paper/60 text-moss">
+                <tr>
+                  <th scope="col" className="px-2 py-2 font-bold">
+                    <span className="sr-only">Value</span>
+                  </th>
+                  <th scope="col" className="px-2 py-2 font-bold">Lowest</th>
+                  <th scope="col" className="px-2 py-2 font-bold">Average</th>
+                  <th scope="col" className="px-2 py-2 font-bold">Highest</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {DAY_MEASURES.map((measure) => (
+                  <tr key={measure.key}>
+                    <th scope="row" className={`${DAY_CELL} font-bold`}>
+                      <MeasureName measure={measure} />
+                    </th>
+                    <td className={DAY_CELL}>{figure(todays[measure.key].min, measure.unit)}</td>
+                    <td className={DAY_CELL}>{figure(todays[measure.key].avg, measure.unit)}</td>
+                    <td className={DAY_CELL}>{figure(todays[measure.key].max, measure.unit)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : (
+        <p className="text-moss">Nothing has come in today yet.</p>
+      )}
+      {days.length > 0 && (
+        <details className="mt-3">
+          <summary className="cursor-pointer font-bold">Day by day, the last 7 days</summary>
+          <p className="mt-1 text-moss">
+            Each day’s average, with its lowest to highest under it. A day with no readings isn’t listed.
+          </p>
+          <div className="relative mt-2 overflow-x-auto rounded-lg border border-line">
+            <table className="w-full text-left">
+              <thead className="border-b border-line bg-paper/60 text-moss">
+                <tr>
+                  <th scope="col" className="px-2 py-2 font-bold">Day</th>
+                  {DAY_MEASURES.map((measure) => (
+                    <th key={measure.key} scope="col" className={`${DAY_CELL} font-bold`}>
+                      <MeasureName measure={measure} /> <span className="font-normal">({measure.headUnit})</span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {days.map((day) => (
+                  <tr key={day.day}>
+                    <th scope="row" className={`${DAY_CELL} font-bold`}>
+                      {dayLabel(day.day, today)}
+                      <span className="block text-xs font-normal text-moss">{plural(day.readings, "reading")}</span>
+                    </th>
+                    {DAY_MEASURES.map((measure) => (
+                      <td key={measure.key} className={DAY_CELL}>
+                        <span className="font-bold">{figure(day[measure.key].avg)}</span>
+                        <span className="block text-xs text-moss">
+                          <RangeText range={day[measure.key]} />
+                        </span>
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
 function NodeCard({
   node,
   settings,
   history,
+  days,
+  today,
   commands,
   device,
   now,
@@ -265,6 +418,10 @@ function NodeCard({
   settings: NodeSettings | null;
   /** Oldest first, or null if it didn't load */
   history: HistoryReading[] | null;
+  /** Newest first, null if they didn't load, or undefined if 026 hasn't been run */
+  days: DailySummary[] | null | undefined;
+  /** Today's park date, like 2026-11-14 */
+  today: string;
   /** Newest first */
   commands: SensorCommand[];
   device: EdgeDevice | null;
@@ -387,6 +544,8 @@ function NodeCard({
               stale={stale}
             />
           </dl>
+
+          {days !== undefined && <DailyFigures nodeId={node.nodeId} days={days} today={today} />}
 
           <div className="mt-4 space-y-4 border-t border-line pt-4">
             {history === null ? (
@@ -522,8 +681,16 @@ export default async function SensorsPage() {
 
   const now = clockNow();
   const supabase = await createClient();
-  const [nodesResult, settingsResult, alertsResult, resolvedResult, devicesResult, positionsResult, commandsResult] =
-    await Promise.all([
+  const [
+    nodesResult,
+    settingsResult,
+    alertsResult,
+    resolvedResult,
+    devicesResult,
+    positionsResult,
+    commandsResult,
+    dailyResult,
+  ] = await Promise.all([
       supabase.from("iot_node_status").select(NODE_COLUMNS),
       supabase.from("iot_nodes").select(SETTINGS_COLUMNS),
       supabase.from("iot_alerts").select(ALERT_COLUMNS).neq("status", "resolved"),
@@ -546,8 +713,11 @@ export default async function SensorsPage() {
         .select(COMMAND_COLUMNS)
         .order("created_at", { ascending: false })
         .limit(COMMANDS_READ),
+      // Today and the 6 days before, for every node, so at most 7 rows a node
+      supabase.from("iot_daily_summary").select(DAILY_COLUMNS).order("day", { ascending: false }),
     ]);
 
+  // Not the daily figures: without 026 the rest of the page still works, and only they say so
   const results = [nodesResult, settingsResult, alertsResult, resolvedResult, devicesResult, positionsResult, commandsResult];
   const missing = results.some((result) => sqlIsMissing(result.error));
   if (!missing) {
@@ -581,7 +751,7 @@ export default async function SensorsPage() {
         <Problem>
           This database hasn’t been set up for sensors yet, or has an older version of the sensor
           tables, so there’s nothing to show here. The other pages aren’t affected. Ask an
-          administrator to run the sensor files, 016_1 to 025, in supabase/README.md.
+          administrator to run the sensor files, 016_1 to 026, in supabase/README.md.
         </Problem>
       </div>
     );
@@ -604,6 +774,14 @@ export default async function SensorsPage() {
   const positions: Map<string, NodePosition> = positionsResult.error
     ? new Map()
     : positionsFromRows(positionsResult.data ?? []);
+  const dailyMissing = sqlIsMissing(dailyResult.error);
+  if (dailyResult.error && !dailyMissing) console.error("Loading the daily figures failed:", dailyResult.error.code);
+  const dailyFor = new Map<string, DailySummary[]>();
+  for (const day of dailyResult.error ? [] : (dailyResult.data ?? []).map(dailyFromRow)) {
+    dailyFor.set(day.nodeId, [...(dailyFor.get(day.nodeId) ?? []), day]);
+  }
+  const daysOf = (nodeId: string) => (dailyMissing ? undefined : dailyResult.error ? null : (dailyFor.get(nodeId) ?? []));
+  const today = parkTime(new Date(now).toISOString()).slice(0, 10);
   const commandsFor = new Map<string, SensorCommand[]>();
   for (const command of commandsResult.error ? [] : (commandsResult.data ?? []).map(commandFromRow)) {
     commandsFor.set(command.nodeId, [...(commandsFor.get(command.nodeId) ?? []), command]);
@@ -786,9 +964,17 @@ export default async function SensorsPage() {
           Sensor nodes
         </h2>
         <p className="max-w-2xl text-moss">
-          Nodes that need someone come first. On the charts, the dashed lines are this node’s alert limits.
-          Hover over or tap a chart to read a value, and each node has a table of its latest readings.
+          Nodes that need someone come first. Each card has today’s lowest, average and highest
+          temperature, humidity and soil moisture, counted from midnight park time, and the same for each
+          of the last 7 days. On the charts, the dashed lines are this node’s alert limits. Hover over or
+          tap a chart to read a value, and each node has a table of its latest readings.
         </p>
+        {dailyMissing && (
+          <p className="mt-2 max-w-2xl text-sm text-moss">
+            The daily lowest, average and highest need 026_iot_daily_summary.sql, which this database
+            doesn’t have yet. Ask an administrator to run it, as in supabase/README.md.
+          </p>
+        )}
         {!nodes ? (
           <Problem>
             The sensor nodes didn’t load, so their readings aren’t shown. This page tries again by itself.
@@ -802,11 +988,14 @@ export default async function SensorsPage() {
         ) : (
           <ul className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             {nodes.map((node) => (
-              <li key={node.nodeId}>
+              // min-w-0 so a wide table scrolls inside its card instead of widening the page
+              <li key={node.nodeId} className="min-w-0">
                 <NodeCard
                   node={node}
                   settings={settingsFor.get(node.nodeId) ?? null}
                   history={historyFor.get(node.nodeId) ?? null}
+                  days={daysOf(node.nodeId)}
+                  today={today}
                   commands={commandsFor.get(node.nodeId) ?? []}
                   device={node.edgeDeviceId ? (deviceFor.get(node.edgeDeviceId) ?? null) : null}
                   now={now}
