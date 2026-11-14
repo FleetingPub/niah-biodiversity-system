@@ -121,7 +121,7 @@ src/
       review/           the review queue: approve or reject records from the mobile app, and send one back
       species/          the species table, new/ to add one, and [slug]/edit and [slug]/delete
       reports/          counts, charts and the print view, and csv/ for the download
-      sensors/          alerts, the map, the sensor nodes and their history, commands, and devices/ for tokens and positions (admins)
+      sensors/          alerts, the map, the sensor nodes with their history and daily lowest, average and highest, commands, and devices/ for tokens and positions (admins)
       users/            who has an account and what each role can do
   components/           shared pieces: park map, tree tag, photo gallery, icons...
   data/                 mock species and records, plus the screen list
