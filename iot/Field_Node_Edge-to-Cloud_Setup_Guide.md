@@ -120,7 +120,7 @@ Supabase has the same uniqueness rule (`node_id`, `boot_id`, `seq`). If an uploa
 
 ## Cloud database: Supabase
 
-The IoT tables live in the same Supabase project as the rest of the Niah National Park system, so they use its roles: `has_any_role()` from migrations 001–015, with officers (`conservation_officer`) and admins seeing the sensor data. They are added by eight migrations, one per table, and a ninth (022) that limits how many readings an edge device can send. They run after 001–015, with the team's 019–021 in between:
+The IoT tables live in the same Supabase project as the rest of the Niah National Park system, so they use its roles: `has_any_role()` from migrations 001–015, with officers (`conservation_officer`) and admins seeing the sensor data. They are added by eight migrations, one per table, a ninth (022) that limits how many readings an edge device can send, and a tenth (026) with each node's daily figures for the Sensors page. They run after 001–015, with the team's 019–021 in between:
 
 | File | Table | What it holds | Who can read / change it through the API |
 | --- | --- | --- | --- |
@@ -133,6 +133,7 @@ The IoT tables live in the same Supabase project as the rest of the Niah Nationa
 | `023_iot_boots.sql` | `iot_boots` | One row per node power-up: position and first / last reading that arrived | Officers and admins read |
 | `024_iot_alert_state.sql` | `iot_alert_state` | edge-com's working state for alerts | Nobody |
 | `025_iot_commands.sql` | `iot_commands` | Commands for the nodes and how far they've got | Officers and admins read and send |
+| `026_iot_daily_summary.sql` | `iot_daily_summary` (a view) | For today and the 6 days before, by park time: each node's readings count and its lowest, average and highest temperature, humidity and soil moisture | Officers and admins read |
 
 Each file checks that the one before it ran, is safe to run again, and runs as one transaction (all of it or none).
 
@@ -174,7 +175,7 @@ The edge and ESP32 files are in the repo's `iot/` folder, and the Supabase files
 | `iot/edge-device/iot-edge` | Ubuntu VM | Shortcut command: `iot-edge status`, `alerts`, `logs`, `sync`, `watch` … |
 | `iot/edge-device/tools/fake-thing.py` | Ubuntu VM | Simulated ESP32 for testing without hardware |
 | `iot/edge-device/mosquitto/field-node.conf`, `iot/edge-device/systemd/*.service` | Ubuntu VM | Broker settings and the two background services |
-| `supabase/016_1 … 025_*.sql` | Supabase SQL Editor | The IoT tables, functions and view (see Cloud database) |
+| `supabase/016_1 … 026_*.sql` | Supabase SQL Editor | The IoT tables, functions and view (see Cloud database) |
 | `supabase/functions/edge-com/index.ts` | Supabase Edge Functions | **edge-com**: checks the device token, unpacks gzip, stores readings and positions, decides alerts and node status, returns commands and calibration |
 | `iot/sensor-node/sensor-node.ino` | ESP32 (Arduino IDE) | The sensor node: sensors, sending on events, MQTT binary frames, its position, NTP time and the three commands |
 | `iot/sensor-node/secrets.example.h` | ESP32 (Arduino IDE) | Copy it to `secrets.h` next to it and fill in the node's Wi-Fi, ID, edge address, node secret and position. git ignores `secrets.h`; never commit it |
@@ -207,6 +208,7 @@ About 15 minutes, done in a browser on Windows, in the project that already has 
    8. `023_iot_boots.sql`
    9. `024_iot_alert_state.sql`
    10. `025_iot_commands.sql`
+   11. `026_iot_daily_summary.sql`
 3. Left sidebar → **Table Editor**: you should see `iot_alert_state`, `iot_alerts`, `iot_boots`, `iot_commands`, `iot_device_tokens`, `iot_devices`, `iot_nodes` and `iot_readings`.
 
 **Deploy edge-com**
