@@ -73,7 +73,7 @@ export default async function DevicesPage() {
         {header}
         <Problem>
           This database hasn’t been set up for sensors yet, or has an older version of the sensor
-          tables, so there aren’t any devices to manage. Run the sensor files, 016_1 to 025, in
+          tables, so there aren’t any devices to manage. Run the sensor files, 016_1 to 026, in
           supabase/README.md first.
         </Problem>
       </div>
