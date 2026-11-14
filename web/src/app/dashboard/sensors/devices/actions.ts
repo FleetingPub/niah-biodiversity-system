@@ -46,7 +46,7 @@ function failed(error: { code?: string }, what: string, exists?: string): Device
   if (sqlIsMissing(error)) {
     return {
       ok: false,
-      message: "This database hasn’t been set up for sensors yet, or has an older version. Run 016_1 to 025 first.",
+      message: "This database hasn’t been set up for sensors yet, or has an older version. Run 016_1 to 026 first.",
     };
   }
   if (error.code === "23505" && exists) return { ok: false, message: exists };
