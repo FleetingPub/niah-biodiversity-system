@@ -2,7 +2,7 @@ import { cache } from "react";
 import { createClient } from "@/lib/supabase/server";
 
 /**
- * True when the error means newer SQL (016_1 to 025 here, 021 for the users page)
+ * True when the error means newer SQL (016_1 to 026 here, 021 for the users page)
  * isn't in this database yet, rather than something going wrong today. The pages
  * say something different for each.
  */
