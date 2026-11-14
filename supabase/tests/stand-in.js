@@ -237,7 +237,7 @@ export async function startStandIn({
   };
 }
 
-// The sensor files, 016_1 to 025
+// The sensor files, 016_1 to 026
 const IOT_FILES = SQL_FILES.filter((file) => file.includes('_iot_'));
 
 async function addTestDevice(db) {
