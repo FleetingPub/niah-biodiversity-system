@@ -10,6 +10,6 @@ ESP32 field nodes send their readings over the region's Wi-Fi to an edge device 
 | `edge-device/` | Tier 2, one for each forest region. `thing-com.py` takes the nodes' readings into SQLite, `cloud-com.py` uploads them to Supabase, `install-edge.sh` sets it all up, and `tools/fake-thing.py` plays a node. |
 | `testing/` | Sketches for trying one part at a time, and `testing/notes.md` on each part. |
 
-The Supabase side is in `supabase/`: the sensor files `016_1` to `017` and `022` to `025`, and the function in `supabase/functions/edge-com/index.ts`. `supabase/README.md` says how to run them.
+The Supabase side is in `supabase/`: the sensor files `016_1` to `017` and `022` to `026`, and the function in `supabase/functions/edge-com/index.ts`. `supabase/README.md` says how to run them.
 
 Tokens and passwords only go in `sensor-node/secrets.h` and the edge's `secrets.toml`. Never in a commit, a chat, a screenshot or a doc.
