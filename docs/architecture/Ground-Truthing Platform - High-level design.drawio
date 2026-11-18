@@ -85,7 +85,7 @@
           <mxGeometry height="75" width="180" x="20" y="45" as="geometry" />
         </mxCell>
         <mxCell id="X0JmJnpCuiGIAJTl2YqB-16" parent="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;" value="Botanist" vertex="1">
-          <mxGeometry height="60" width="30" x="180" y="340" as="geometry" />
+          <mxGeometry height="60" width="30" x="310" y="340" as="geometry" />
         </mxCell>
         <mxCell id="X0JmJnpCuiGIAJTl2YqB-17" parent="1" style="shape=umlActor;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;html=1;outlineConnect=0;" value="Conservation officer /&lt;br&gt;visitor (scans QR tag)" vertex="1">
           <mxGeometry height="60" width="30" x="1198" y="435" as="geometry" />
