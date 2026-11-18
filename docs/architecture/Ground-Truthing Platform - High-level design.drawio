@@ -1,1 +1,130 @@
-<mxfile host="app.diagrams.net"><diagram name="High-level design" id="hld"><mxGraphModel dx="1200" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="850" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="c3" value="Tier 1: Mobile client (botanist's phone, works offline)" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1"><mxGeometry x="100" y="20" width="640" height="230" as="geometry"/></mxCell><mxCell id="c4" value="Tier 2: Cloud services (Supabase)" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1"><mxGeometry x="100" y="300" width="640" height="120" as="geometry"/></mxCell><mxCell id="c5" value="Tier 3: Central data (Supabase)" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1"><mxGeometry x="100" y="470" width="640" height="130" as="geometry"/></mxCell><mxCell id="c6" value="Other subsystems" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;dashed=1;" vertex="1" parent="1"><mxGeometry x="790" y="300" width="220" height="300" as="geometry"/></mxCell><mxCell id="c7" value="&lt;b&gt;App screens&lt;/b&gt;&lt;br&gt;React Native + Expo" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="c3"><mxGeometry x="20" y="50" width="190" height="60" as="geometry"/></mxCell><mxCell id="c8" value="&lt;b&gt;Device features&lt;/b&gt;&lt;br&gt;camera, GPS, QR generator" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="c3"><mxGeometry x="260" y="50" width="170" height="60" as="geometry"/></mxCell><mxCell id="c9" value="&lt;b&gt;Local database&lt;/b&gt;&lt;br&gt;SQLite" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="c3"><mxGeometry x="25" y="132" width="180" height="85" as="geometry"/></mxCell><mxCell id="c10" value="&lt;b&gt;Sync manager&lt;/b&gt;&lt;br&gt;upload queue, retries,&lt;br&gt;connection check" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="c3"><mxGeometry x="440" y="142" width="170" height="66" as="geometry"/></mxCell><mxCell id="c11" value="&lt;b&gt;Storage API&lt;/b&gt;&lt;br&gt;photo uploads" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="c4"><mxGeometry x="20" y="45" width="150" height="55" as="geometry"/></mxCell><mxCell id="c12" value="&lt;b&gt;Supabase Auth&lt;/b&gt;&lt;br&gt;login, tokens, roles" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="c4"><mxGeometry x="230" y="45" width="160" height="55" as="geometry"/></mxCell><mxCell id="c13" value="&lt;b&gt;REST API&lt;/b&gt;&lt;br&gt;Row Level Security" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="c4"><mxGeometry x="440" y="45" width="170" height="55" as="geometry"/></mxCell><mxCell id="c14" value="&lt;b&gt;Photo storage&lt;/b&gt;&lt;br&gt;private bucket" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="c5"><mxGeometry x="20" y="36" width="150" height="80" as="geometry"/></mxCell><mxCell id="c15" value="&lt;b&gt;PostgreSQL&lt;/b&gt;&lt;br&gt;central database (plant records, species, users)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="c5"><mxGeometry x="280" y="36" width="330" height="80" as="geometry"/></mxCell><mxCell id="c16" value="&lt;b&gt;Web platform&lt;/b&gt;&lt;br&gt;React on Vercel&lt;br&gt;(Digital Plant Knowledge System)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;" vertex="1" parent="c6"><mxGeometry x="20" y="45" width="180" height="75" as="geometry"/></mxCell><mxCell id="c17" value="&lt;b&gt;IoT monitoring dashboard&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;" vertex="1" parent="c6"><mxGeometry x="20" y="216" width="180" height="60" as="geometry"/></mxCell><mxCell id="c18" value="Botanist" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;" vertex="1" parent="1"><mxGeometry x="40" y="70" width="30" height="60" as="geometry"/></mxCell><mxCell id="c19" value="Conservation officer /&lt;br&gt;visitor (scans QR tag)" style="shape=umlActor;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;html=1;outlineConnect=0;" vertex="1" parent="1"><mxGeometry x="948" y="165" width="30" height="60" as="geometry"/></mxCell><mxCell id="c20" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="c18" target="c7"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c21" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="c7" target="c8"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c22" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;entryDx=0;" edge="1" parent="1" source="c7" target="c9"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c23" value="records to upload" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;exitDx=0;exitDy=0;" edge="1" parent="1" source="c9" target="c10"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c24" value="HTTPS, only when online" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;entryX=0.8203;entryY=0;" edge="1" parent="1" source="c10" target="c4"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c25" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="c11" target="c14"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c26" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=0.5;exitY=1;entryX=0.7424;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="c13" target="c15"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c27" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=0;exitY=0.3667;entryX=1;entryY=0.5;" edge="1" parent="1" source="c16" target="c13"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c28" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="c17" target="c15"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell><mxCell id="c29" value="website" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;entryX=0.85;entryY=0;" edge="1" parent="1" source="c19" target="c16"><mxGeometry relative="1" as="geometry"></mxGeometry></mxCell></root></mxGraphModel></diagram></mxfile>
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net">
+  <diagram name="High-level design" id="n0SY0LexpdAiA1WQ41sx">
+    <mxGraphModel dx="1238" dy="663" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-1" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#d5e8d4;strokeColor=#82b366;" value="Tier 1: Mobile client (botanist&#39;s phone, works offline), IoT nodes (sensor, edge)" vertex="1">
+          <mxGeometry height="314.5" width="640" x="350" y="205.5" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-2" parent="X0JmJnpCuiGIAJTl2YqB-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;App screens&lt;/b&gt;&lt;br&gt;React Native + Expo" vertex="1">
+          <mxGeometry height="60" width="190" x="20" y="134.5" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-3" parent="X0JmJnpCuiGIAJTl2YqB-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;Device features&lt;/b&gt;&lt;br&gt;camera, GPS, QR generator" vertex="1">
+          <mxGeometry height="60" width="170" x="260" y="134.5" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-4" parent="X0JmJnpCuiGIAJTl2YqB-1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;Local database&lt;/b&gt;&lt;br&gt;SQLite" vertex="1">
+          <mxGeometry height="85" width="180" x="25" y="216.5" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-5" parent="X0JmJnpCuiGIAJTl2YqB-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;Sync manager&lt;/b&gt;&lt;br&gt;upload queue, retries,&lt;br&gt;connection check" vertex="1">
+          <mxGeometry height="66" width="170" x="440" y="226.5" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-19" edge="1" parent="X0JmJnpCuiGIAJTl2YqB-1" source="X0JmJnpCuiGIAJTl2YqB-2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="X0JmJnpCuiGIAJTl2YqB-3" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-20" edge="1" parent="X0JmJnpCuiGIAJTl2YqB-1" source="X0JmJnpCuiGIAJTl2YqB-2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;entryDx=0;" target="X0JmJnpCuiGIAJTl2YqB-4" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-21" edge="1" parent="X0JmJnpCuiGIAJTl2YqB-1" source="X0JmJnpCuiGIAJTl2YqB-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;exitDx=0;exitDy=0;" target="X0JmJnpCuiGIAJTl2YqB-5" value="records to upload">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-55" parent="X0JmJnpCuiGIAJTl2YqB-1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;Local Edge Database&lt;/b&gt;&lt;br&gt;SQLite" vertex="1">
+          <mxGeometry height="85" width="170" x="285" y="34.5" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-54" parent="X0JmJnpCuiGIAJTl2YqB-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;Edge Thing Com&lt;/b&gt;&lt;div&gt;Python Script&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="125" x="135" y="47" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-52" edge="1" parent="X0JmJnpCuiGIAJTl2YqB-1" source="X0JmJnpCuiGIAJTl2YqB-54" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;" target="X0JmJnpCuiGIAJTl2YqB-55" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-57" parent="X0JmJnpCuiGIAJTl2YqB-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;Sensor node&lt;/b&gt;&lt;br&gt;ESP32" vertex="1">
+          <mxGeometry height="60" width="100" x="10" y="47" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-58" edge="1" parent="X0JmJnpCuiGIAJTl2YqB-1" source="X0JmJnpCuiGIAJTl2YqB-57" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" target="X0JmJnpCuiGIAJTl2YqB-54" value="">
+          <mxGeometry relative="1" x="-0.0909" y="20" as="geometry">
+            <mxPoint as="offset" />
+            <mxPoint x="-80" y="77" as="sourcePoint" />
+            <mxPoint x="40" y="77" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-56" parent="X0JmJnpCuiGIAJTl2YqB-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="&lt;b&gt;Edge Cloud Com&lt;/b&gt;&lt;div&gt;Python Script&lt;/div&gt;" vertex="1">
+          <mxGeometry height="66" width="150" x="480" y="44" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-53" edge="1" parent="X0JmJnpCuiGIAJTl2YqB-1" source="X0JmJnpCuiGIAJTl2YqB-55" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;exitDx=0;exitDy=0;" target="X0JmJnpCuiGIAJTl2YqB-56" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-6" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Tier 2: Cloud services (Supabase)" vertex="1">
+          <mxGeometry height="120" width="640" x="350" y="570" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-7" parent="X0JmJnpCuiGIAJTl2YqB-6" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="&lt;b&gt;Storage API&lt;/b&gt;&lt;br&gt;photo uploads" vertex="1">
+          <mxGeometry height="55" width="150" x="20" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-8" parent="X0JmJnpCuiGIAJTl2YqB-6" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="&lt;b&gt;Supabase Auth&lt;/b&gt;&lt;br&gt;login, tokens, roles" vertex="1">
+          <mxGeometry height="55" width="160" x="230" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-9" parent="X0JmJnpCuiGIAJTl2YqB-6" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="&lt;b&gt;REST API&lt;/b&gt;&lt;br&gt;Row Level Security" vertex="1">
+          <mxGeometry height="55" width="170" x="440" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-10" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#fff2cc;strokeColor=#d6b656;" value="Tier 3: Central data (Supabase)" vertex="1">
+          <mxGeometry height="130" width="640" x="350" y="740" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-11" parent="X0JmJnpCuiGIAJTl2YqB-10" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#fff2cc;strokeColor=#d6b656;" value="&lt;b&gt;Photo storage&lt;/b&gt;&lt;br&gt;private bucket" vertex="1">
+          <mxGeometry height="80" width="150" x="20" y="36" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-12" parent="X0JmJnpCuiGIAJTl2YqB-10" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#fff2cc;strokeColor=#d6b656;" value="&lt;b&gt;PostgreSQL&lt;/b&gt;&lt;br&gt;central database (plant records, species, users)" vertex="1">
+          <mxGeometry height="80" width="330" x="280" y="36" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-13" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;dashed=1;" value="Other subsystems" vertex="1">
+          <mxGeometry height="200" width="220" x="1040" y="570" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-15" parent="X0JmJnpCuiGIAJTl2YqB-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;" value="&lt;b&gt;IoT monitoring dashboard&lt;/b&gt;" vertex="1">
+          <mxGeometry height="60" width="138" x="41" y="110" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-14" parent="X0JmJnpCuiGIAJTl2YqB-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontColor=#333333;" value="&lt;b&gt;Web platform&lt;/b&gt;&lt;br&gt;React on Vercel&lt;br&gt;(Digital Plant Knowledge System)" vertex="1">
+          <mxGeometry height="75" width="180" x="20" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-16" parent="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;" value="Botanist" vertex="1">
+          <mxGeometry height="60" width="30" x="180" y="340" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-17" parent="1" style="shape=umlActor;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;html=1;outlineConnect=0;" value="Conservation officer /&lt;br&gt;visitor (scans QR tag)" vertex="1">
+          <mxGeometry height="60" width="30" x="1198" y="435" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-18" edge="1" parent="1" source="X0JmJnpCuiGIAJTl2YqB-16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" target="X0JmJnpCuiGIAJTl2YqB-2" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-23" edge="1" parent="1" source="X0JmJnpCuiGIAJTl2YqB-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="X0JmJnpCuiGIAJTl2YqB-11" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-24" edge="1" parent="1" source="X0JmJnpCuiGIAJTl2YqB-9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=0.5;exitY=1;entryX=0.7424;entryY=0;entryDx=0;entryDy=0;" target="X0JmJnpCuiGIAJTl2YqB-12" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-25" edge="1" parent="1" source="X0JmJnpCuiGIAJTl2YqB-14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;startArrow=classic;startFill=1;exitX=0;exitY=0.3667;entryX=1;entryY=0.5;" target="X0JmJnpCuiGIAJTl2YqB-9" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-27" edge="1" parent="1" source="X0JmJnpCuiGIAJTl2YqB-17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;entryX=0.85;entryY=0;" target="X0JmJnpCuiGIAJTl2YqB-14" value="website">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-28" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=26;fillColor=#d5e8d4;strokeColor=#82b366;" value="Tier 1: Mobile client (botanist&#39;s phone, works offline), IoT nodes (sensor, edge)" vertex="1">
+          <mxGeometry height="230" width="640" x="1620" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-59" edge="1" parent="1" source="X0JmJnpCuiGIAJTl2YqB-56" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" target="X0JmJnpCuiGIAJTl2YqB-6" value="">
+          <mxGeometry relative="1" x="0.8028" y="20" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="905" y="390" />
+              <mxPoint x="970" y="390" />
+            </Array>
+            <mxPoint x="960" y="320" as="sourcePoint" />
+            <mxPoint x="960" y="627" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="X0JmJnpCuiGIAJTl2YqB-22" edge="1" parent="1" source="X0JmJnpCuiGIAJTl2YqB-5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;entryX=0.8203;entryY=0;" target="X0JmJnpCuiGIAJTl2YqB-6" value="HTTPS, only when online">
+          <mxGeometry relative="1" x="0.1665" y="45" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
